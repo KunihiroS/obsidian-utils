@@ -713,10 +713,239 @@ OPENAI_MODEL="gpt-5.2"
   - 概要: 論文要約後、OpenAIもしくはGeminiのDR APIを使いWebのソースからDeep Researchを行い、指定のディレクトリのレポートを保存する。
   - DR対象: Webソースとし、Vault内は対象外
   - メリット: AI ProviderのAPIを利用することで開発工数がかなり下がる。
-  - 実装詳細は下記を参照すること
-    - /home/kunihiros/.windsurf/plans/deep-research-simple-02690d.md
   - [ ] 方針検討
   - [ ] 設計
   - [ ] 実装
   - [ ] テスト
-  
+
+# Deep Research シンプル機能の実装詳細
+
+本計画は、論文ノート生成フローの最後に provider-native Deep Research（Gemini）を自動実行し、Webソース由来の調査レポートをVaultに保存するための要件整理と詳細設計を定義します。
+
+## スコープ
+
+- 対象（やること）
+  - 既存フロー（ノート作成→リネーム→HTML/PDF取得→要約）の**要約完了後**に、Deep Research（シンプル）を**自動実行**する。
+  - Deep Research は **provider-native Deep Research API** を使い、**Webソースのみ**を対象に調査する（Vault内検索はしない）。
+  - 調査レポート（Markdown）を Vault 内の指定フォルダへ保存する。
+  - ログは既存と同様に redaction 強制、`reason` を付与し、ユーザーには Notice で進捗/結果を通知する。
+
+- 非対象（やらないこと）
+  - PageIndex 統合（中止）。
+  - GPT Researcher MCP Server 連携（アドバンス機能側）。
+  - Vault 内コンテンツを対象とした Deep Research。
+
+## 現状アーキテクチャ（リポジトリ確認済み）
+
+- **コマンド/オーケストレーション**: `src/main.ts`
+  - テンプレノート作成 → タイトルリネーム → HTML/PDF取得 → 要約生成（`summary_generator`）を直列で実行。
+  - `runExclusive` で並行実行を防止。
+
+- **LLM provider 抽象**: `src/llm/*`
+  - `createProvider(settings)` が `settings.envPath` の `.env` を読み込み provider を選択。
+  - `.env` の `LLM_PROVIDER` により `openai` / `gemini` を切替。
+  - 既存: OpenAI は `OPENAI_MODEL` 空でスキップ（`OPENAI_MODEL_EMPTY_SKIP`）。
+  - 既存インターフェース: `LlmProvider.summarize({systemPrompt,userContent})`。
+
+- **要約生成オーケストレーション**: `src/summary_generator.ts`
+  - 保存済みHTMLを読み込み、system prompt を読み込み、`createProvider` → `provider.summarize`。
+  - 要約ブロックをノートへ upsert。
+
+## 要件（A: Deep Research シンプル）
+
+### ユーザーストーリー
+
+- ユーザーとして、論文ノート作成と要約が完了したら、同じ対象ノートに紐づく Deep Research（Web調査）を自動実行し、調査レポートをVaultに保存したい。
+
+### 入力
+
+- DRクエリ/指示（固定。ユーザーが作成）
+  - `deepResearchPromptPath`（Vault相対パス）で指定したファイルの内容をそのまま使う
+- 論文コンテキスト
+  - 生成済みの要約（summary ブロック）全文を入力に含める
+  - arXiv URL を入力に含める
+
+- 論文コンテキストの投入方式（決定）
+  - 方針: **固定プロンプト（Deep Research 指示） + 追加コンテキスト**の形で投入する。
+  - 追加コンテキストは **要約全文 + arXiv URL** を渡す。
+
+- 実装上の扱い
+  - 固定のDRクエリ/指示（`deepResearchPromptPath` の中身）は、そのまま投入する。
+  - こちらでは DRクエリ/指示の生成や要約・言い換え等の加工はしない。
+  - 要約全文 + arXiv URL を渡して Deep Research を実行する。
+- 要約抽出（既存）
+  - 既存の summary ブロック抽出処理を流用する。
+
+### 出力
+
+- Vault 内に Markdown レポートを保存する。
+- 保存先: **paper_extractor が生成した添付ディレクトリ内**
+  - 例: `path/to/<noteBaseName>/<arxivId>_deep_research.md`
+- ファイル名は衝突回避・検索性重視
+  - 例: `<arxivId>_deep_research.md`（同一論文で上書き運用）
+
+### 安全性/課金コントロール
+
+- 本機能は自動実行だが、事故防止のために **明示的にONできる設定**を設ける（例: `deepResearchEnabled`）。
+- Deep Research は Gemini 固定のため、`.env` の `LLM_PROVIDER` が `openai` の場合は **DRはスキップ**し、ログに理由を記録する。
+- トグルがONでGemini の認証情報が取得できない場合は、**エラーでログに記録してDRを終了**。
+  - 具体例: `.env` から `GEMINI_API_KEY` を取得できない。
+- ログは秘密情報を絶対に出さない（既存の redaction 方針を踏襲）。
+- Notice で進捗を通知する（開始/調査中/完了/失敗）。
+  - 調査中 Notice は `deepResearchNoticeIntervalSec`（秒）で表示する。
+  - Notice messageは "DR: <arxivId> undergoing" とする。
+
+### UX
+
+- 実行タイミング
+  - **要約（`summary_generator`）の直後に自動実行**。
+- 対象ノート
+  - 既存フローの対象ノート（要約を書き込んだノート）をそのまま Deep Research の対象とする。
+- 長時間処理の扱い
+  - Gemini Deep Research が非同期/ポーリング型フォアグラウンド（最小実装）で開始し、将来は永続化（再起動再開）を検討。
+
+## 詳細設計
+
+### 1) 実行ポイント（エントリポイント）
+
+- `src/main.ts` の既存パイプラインに組み込む
+  - `await generateSummary(...)` の後に `await runDeepResearchSimple(...)` を呼ぶ。
+  - これにより「当然その対象（要約対象ノート）」を担保。
+
+（補助）デバッグ/手動実行用コマンドは将来追加しても良いが、MVPでは不要。
+
+### 2) 設定（MyPluginSettings）
+
+追加（Vault path は Vault 相対を基本とする）:
+
+- `deepResearchEnabled: boolean`（デフォルト: false）
+  - true の時だけ自動実行
+- `deepResearchPromptPath: string`（Deep Research 用の prompt。要約用とは別ファイル）
+- `deepResearchNoticeIntervalSec: number`（デフォルト: 5）
+- `deepResearchMode: 'foreground' | 'background'`（初期は `foreground`、将来 `background`）
+
+将来（phase 2）:
+- `deepResearchJobs: Array<{ id, startedAt, notePath, outputPath, status }>` を `saveData()` で永続化
+
+### 3) `.env` 変数
+
+方針: **Gemini 固定**。
+
+- 必須
+  - `LLM_PROVIDER=gemini`
+  - `GEMINI_API_KEY=...`
+  - `GEMINI_MODEL=...`（既存の provider 初期化に必要）
+
+Deep Research でモデルを分けたい場合は、将来
+- `GEMINI_DR_MODEL`
+を追加する（MVPでは `GEMINI_MODEL` を流用しても良い）。
+
+重要: Gemini のキーが取得できない場合は **エラーで中止**（スキップしない）。
+
+- `LLM_PROVIDER=openai` の場合
+  - Deep Research は **実行しない（スキップ）**
+  - ログに理由を記録する（例: `DR_PROVIDER_NOT_GEMINI_SKIP`）
+
+### 4) Provider 抽象の拡張
+
+要約用 `summarize` と Deep Research は責務が異なるため、同じメソッドに混ぜない。
+
+- 新規インターフェース案: `DeepResearchProvider`
+  - `start(params) -> { id }`（非同期開始）
+  - `get(id) -> { status, output }`
+
+または provider が同期1発で返せるなら
+- `run(params) -> markdownReport`
+
+Factory は
+- `createDeepResearchProvider(settings)` を新設（`createProvider` とは分離）
+を推奨。
+
+### 5) オーケストレーション（新規モジュール）
+
+`src/deep_research_simple.ts`（仮）を追加し、責務を `main.ts` から分離する。
+
+- 入力: `app`, `settings`, `noteFile`, `inputUrl`
+- `summary` ブロックを抽出
+- prompt 読み込み（`deepResearchPromptPath`）
+- Gemini Deep Research API 呼び出し
+- レポート保存（`deepResearchOutputDir`）
+
+### 6) ログ/Reason 設計
+
+既存の `startLogBlock` / `endLogBlock` 形式に合わせる。
+
+- 例: `component=deep_research_simple notePath=... id=... provider=gemini model=...`
+
+reason 候補:
+- `DR_DISABLED_SKIP`（設定OFFのためスキップ）
+- `DR_ENV_PATH_MISSING` / `DR_ENV_READ_FAILED`
+- `DR_LLM_PROVIDER_INVALID`（`LLM_PROVIDER!=gemini`）
+- `DR_GEMINI_API_KEY_MISSING`（必須。ここは NG で中止）
+- `DR_GEMINI_MODEL_MISSING`（必須。ここは NG で中止）
+- `DR_PROMPT_READ_FAILED`
+- `DR_INPUT_MISSING`（summary ブロックが無い等）
+- `DR_REQUEST_FAILED`
+- `DR_WRITE_FAILED`
+- `DR_OK`
+
+### 7) バックグラウンド/再開（phase 2）
+
+Gemini がポーリング必須の場合、以下を永続化して再起動後に再開できる設計にする。
+
+- job id
+- output path
+- started time
+
+`onload()` で未完了ジョブを定期チェックする（`registerInterval`）。
+
+## 決定事項（ユーザー確定）
+
+- 対象ノート: 要約の対象ノート（同一 `noteFile`）
+- 実行タイミング: 自動（要約の直後）
+- DRクエリ/指示: 固定（ユーザーが用意した文面を `deepResearchPromptPath` から読み込んで使用）
+- Provider: Gemini 固定
+  - `.env` から Gemini のキーが取れない場合は **エラーで中止**
+
+## 受け入れ条件（Acceptance criteria）
+
+- `deepResearchEnabled=true` の場合、要約完了後に Deep Research が自動実行される。
+- `.env` が読めない、または `LLM_PROVIDER!=gemini` の場合は NG で中止し、Notice と `reason` が残る。
+- `GEMINI_API_KEY` / `GEMINI_MODEL` が取得できない場合は NG で中止し、AIリクエストは行わない。
+- 成功時、VaultにレポートMarkdownが作成され、Noticeで完了が分かる。
+- ログに秘密情報が出ない（redaction強制）。
+
+## 失敗時の影響範囲（重要）
+
+- Deep Research は **要約の後段**で動くため、DRが失敗しても
+  - タイトルリネーム
+  - HTML/PDF保存
+  - 要約の書き込み
+ には影響しない（既に完了している前段をロールバックしない）。
+- 失敗時は
+  - Noticeで失敗を通知
+  - ログに `result=NG reason=...` を残す
+  だけを行い、コマンド全体としては「DR失敗」で終了する。
+
+## Reference
+Instruction prompt sample:
+
+```
+This is instruction prompt to creat deep research report based on added {context}.
+
+# Condition
+{context} is a scientific paper acquired from arxive site.
+Created Deep research output is for human reader who understand the abstract and details of {context}.
+
+# Needs
+Deep research aims to investigate web to find out the following additional info cohered with {context}
+- Domain information
+  - Overview of the specific domain that {context} related make clear overall understanding to the research domain.
+- Histrical trend
+  - The historical information of the domain, how the domain technologies developed, what was the original science tech and more.
+- Similar researches list
+  - Similar and competitive recent researched to {context}
+
+# Requirement
+The output must be in Lang:JA.
+```
