@@ -4,6 +4,15 @@ import {endLogBlock, formatErrorForLog, startLogBlock} from './logger';
 import type {MyPluginSettings} from './settings';
 import {createProvider} from './llm/createProvider';
 
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+	return Promise.race([
+		promise,
+		new Promise<T>((_, reject) =>
+			setTimeout(() => reject(new Error(`${label}_TIMEOUT`)), ms)
+		),
+	]);
+}
+
 // Summary is written as a replaceable block.
 // This keeps reruns idempotent (re-run replaces the previous summary instead of appending).
 const SUMMARY_START_MARKER = '<!-- paper_extractor:summary:start -->';
@@ -166,10 +175,12 @@ export async function generateSummary(
 			}, 3000);
 
 			const userContent = `You will be given HTML extracted from an arXiv paper. Summarize it in Japanese as Markdown.\n\n[HTML]\n${htmlText}`;
-			summary = await providerResult.provider.summarize({
-				systemPrompt,
-				userContent,
-			});
+			const timeoutMs = (settings.llmTimeoutSec ?? 180) * 1000;
+			summary = await withTimeout(
+				providerResult.provider.summarize({ systemPrompt, userContent }),
+				timeoutMs,
+				providerName.toUpperCase()
+			);
 		} catch (e) {
 			reason = `${providerName.toUpperCase()}_REQUEST_FAILED`;
 			const info = formatErrorForLog(e);

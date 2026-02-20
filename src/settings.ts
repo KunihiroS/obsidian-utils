@@ -7,6 +7,7 @@ export interface MyPluginSettings {
 	envPath: string;
 	templatePath: string;
 	summaryEnabled: boolean;
+	llmTimeoutSec: number;
 }
 
 export const DEFAULT_SETTINGS: MyPluginSettings = {
@@ -15,6 +16,7 @@ export const DEFAULT_SETTINGS: MyPluginSettings = {
 	envPath: '',
 	templatePath: '',
 	summaryEnabled: true,
+	llmTimeoutSec: 180,
 }
 
 export class SampleSettingTab extends PluginSettingTab {
@@ -84,6 +86,19 @@ export class SampleSettingTab extends PluginSettingTab {
 					await this.plugin.saveSettings();
 				}));
 
+		new Setting(containerEl)
+			.setName('AI request timeout (seconds)')
+			.setDesc('Timeout in seconds for LLM API requests. Default: 180. Must be a positive integer.')
+			.addText(text => text
+				.setPlaceholder('180')
+				.setValue(String(this.plugin.settings.llmTimeoutSec))
+				.onChange(async (value) => {
+					const n = parseInt(value, 10);
+					if (!isNaN(n) && n > 0) {
+						this.plugin.settings.llmTimeoutSec = n;
+						await this.plugin.saveSettings();
+					}
+				}));
 
 	}
 }
