@@ -3,17 +3,30 @@ import {readEnvFileOrThrow} from './env';
 import type {LlmProvider} from './types';
 import {OpenAiChatProvider} from './providers/openai_chat_provider';
 import {GeminiProvider} from './providers/gemini_provider';
+import * as os from 'os';
+import * as path from 'path';
 
 export type ProviderCreateResult =
 	| {status: 'disabled'; reason: string}
 	| {status: 'enabled'; provider: LlmProvider; providerName: string; model: string};
+
+function expandHomeDir(p: string): string {
+	const v = p.trim();
+	if (v === '~') {
+		return os.homedir();
+	}
+	if (v.startsWith('~/') || v.startsWith('~\\')) {
+		return path.join(os.homedir(), v.slice(2));
+	}
+	return v;
+}
 
 // Factory for LLM providers.
 // - Reads `.env` from settings.envPath (Vault-external) and selects the provider implementation.
 // - Returns {status:'disabled'} for non-fatal skip states (handled by caller with Notice/log reason).
 // - Throws only for hard misconfiguration (e.g. missing required API key/model for the selected provider).
 export async function createProvider(settings: MyPluginSettings): Promise<ProviderCreateResult> {
-	const envPath = settings.envPath?.trim() ?? '';
+	const envPath = expandHomeDir(settings.envPath?.trim() ?? '');
 	if (envPath.length === 0) {
 		return {status: 'disabled', reason: 'ENV_PATH_MISSING'};
 	}
