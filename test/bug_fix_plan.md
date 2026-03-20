@@ -114,7 +114,46 @@ function sanitizeTitleAsNoteBaseName(input: string): string {
 
 本プロジェクトにはテストフレームワークが導入されていないため、以下の手動検証を提案します：
 
-1. **ビルド**: `npm run build` でエラーなくビルドが通ること確認
-2. **実際の動作テスト**: Obsidian Vault に [main.js](file:///home/kunihiros/dev/paper-extractor/main.js) をコピーし、以下の URL で動作確認
+1. **ビルド**: `pnpm run build` でエラーなくビルドが通ること確認
+2. **問題URLでの再現確認**: Obsidian Vault に [main.js](file:///home/kunihiros/dev/paper-extractor/main.js) をコピーし、以下の URL で動作確認
    - `https://arxiv.org/abs/2509.19783`（問題の論文 — タイトルに `"` と `:` を含む）
-   - **期待結果**: 1つのノートファイルが `Agentic Metacognition_ Designing a _Self-Aware_ Low-Code Agent for Failure Prediction and Human Handoff.md` として作成される（`"` と `:` が `_` に変換）
+   - **期待結果**:
+     - 1つのノートファイルのみが `Agentic Metacognition_ Designing a _Self-Aware_ Low-Code Agent for Failure Prediction and Human Handoff.md` として作成される（`"` と `:` が `_` に変換）
+     - タイトルが途中で切れた別ノートが作成されない
+     - 添付フォルダが1つだけ作成される
+     - 要約が上記ノートに追記される
+3. **特殊文字の追加確認**: 可能であれば、`citation_title` に以下を含むケースでも手動確認する
+   - `'` を含むタイトル
+   - `&amp;` など他のHTML文字参照を含むタイトル
+   - `#`、`^`、`[`、`]` を含むタイトル
+   - **期待結果**: タイトル抽出が途中で切れず、禁止文字のみ `_` に置換される
+4. **異常系確認**: `citation_title` が取得できないケースで、ノートが不正なタイトルにリネームされないことを確認する
+   - **期待結果**:
+     - エラー通知される
+     - タイトル変更が行われない
+     - 追加の不正ファイル/フォルダが生成されない
+
+### Regression Focus
+
+今回の修正では、単にタイトル文字列が正しく取得できることだけではなく、以下の副作用が解消されていることを確認対象に含める：
+
+- **二重生成防止**: ノートファイルが複数作成されないこと
+- **保存先整合性**: HTML/PDF 保存先フォルダが最終ノート名と一致すること
+- **要約追記先整合性**: `summary_generator` が正しいノートに対して処理すること
+
+### Deploy / Verification Steps
+
+1. **ビルド**: `pnpm run build`
+2. **成果物確認**:
+   - `main.js`
+   - `manifest.json`
+   - `styles.css`（存在する場合のみ）
+3. **Vaultへ配置（手動）**:
+   - `VaultFolder/.obsidian/plugins/paper_extractor/` に上記成果物をコピー
+4. **Obsidianで再読み込み**:
+   - アプリ再起動、またはプラグイン再読み込みで反映
+5. **デプロイ後確認**:
+   - `https://arxiv.org/abs/2509.19783` で問題が再発しないこと
+   - ノート/添付フォルダの二重生成がないこと
+6. **ドキュメント更新確認**:
+   - 少なくとも `CHANGELOG.md` の更新要否を確認する

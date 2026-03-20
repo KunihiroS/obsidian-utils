@@ -1,6 +1,7 @@
 import {App, TFile, normalizePath, requestUrl} from 'obsidian';
 import {extractArxivIdFromUrl, getArxivAbsUrl} from './arxiv';
 import {endLogBlock, formatErrorForLog, startLogBlock} from './logger';
+import {extractCitationTitleFromAbsHtml, sanitizeTitleAsNoteBaseName} from './title_parser';
 
 export type TitleExtractResult = {
 	id: string;
@@ -8,29 +9,6 @@ export type TitleExtractResult = {
 	newNotePath: string;
 	newTitle: string;
 };
-
-function extractCitationTitleFromAbsHtml(html: string): string {
-	const metaTagMatch = html.match(/<meta[^>]*name=["']citation_title["'][^>]*>/i);
-	if (metaTagMatch) {
-		const tag = metaTagMatch[0];
-		const contentMatch = tag.match(/content=["']([^"']+)["']/i);
-		const content = contentMatch?.[1];
-		if (content) return content;
-	}
-
-	const metaTagMatch2 = html.match(/<meta[^>]*content=["']([^"']+)["'][^>]*name=["']citation_title["'][^>]*>/i);
-	if (metaTagMatch2) {
-		const content = metaTagMatch2[1];
-		if (content) return content;
-	}
-
-	throw new Error('citation_title not found');
-}
-
-function sanitizeTitleAsNoteBaseName(input: string): string {
-	const collapsed = input.replace(/\s+/g, ' ').trim();
-	return collapsed.replace(/[\\/:*?"<>|]/g, '_').trim();
-}
 
 export async function extractAndRenameNoteTitle(
 	app: App,
