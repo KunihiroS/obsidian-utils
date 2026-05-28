@@ -64,3 +64,14 @@ main.ts (orchestrator)
 2. Run `pnpm run version` to update `versions.json` and stage both files.
 3. Create a GitHub release tagged exactly as the version string.
 4. Attach `main.js`, `manifest.json`, `styles.css` as release assets.
+
+## AMC Context Model
+```yaml
+purpose: ユーザーが特定の研究資料（特に arXiv）を効率的に収集・管理し、外部 LLM API（OpenAI/Gemini）や MCP サーバーを介した高度な要約機能を持つ、自動化された研究ノート作成ワークフローを構築すること。
+purpose_confirmed: false
+approach: null
+plan:
+  completed: []
+  current: null
+  next: []
+```
