@@ -14,19 +14,19 @@ export type AttemptEvent =
 	| {type: 'failure'; attempt: number; providerName: string; model: string; reason: AttemptFailureReason};
 
 export type AttemptResult =
-	| {attempt: number; providerName: string; model: string; outcome: 'success'}
-	| {attempt: number; providerName: string; model: string; outcome: 'failure'; reason: AttemptFailureReason};
+	| Readonly<{attempt: number; providerName: string; model: string; outcome: 'success'}>
+	| Readonly<{attempt: number; providerName: string; model: string; outcome: 'failure'; reason: AttemptFailureReason}>;
 
-export type FallbackResult = {
+export type FallbackResult = Readonly<{
 	summary: string;
 	providerName: string;
 	model: string;
-	attempts: AttemptResult[];
-};
+	attempts: readonly AttemptResult[];
+}>;
 
 export type FallbackOptions = {
 	timeoutMs: number;
-	onAttempt?: (event: AttemptEvent) => void;
+	onAttempt?: (event: AttemptEvent) => void | Promise<void>;
 };
 
 class ProviderTimeoutError extends Error {}
@@ -37,7 +37,22 @@ export class FallbackAggregateError extends Error {
 	constructor(attempts: readonly AttemptResult[]) {
 		super('All LLM provider attempts failed');
 		this.name = 'FallbackAggregateError';
-		this.attempts = attempts;
+		this.attempts = immutableAttempts(attempts);
+	}
+}
+
+function immutableAttempts(attempts: readonly AttemptResult[]): readonly AttemptResult[] {
+	return Object.freeze(attempts.map((attempt) => Object.freeze({...attempt})));
+}
+
+async function emitAttempt(
+	onAttempt: FallbackOptions['onAttempt'],
+	event: AttemptEvent
+): Promise<void> {
+	try {
+		await onAttempt?.(event);
+	} catch {
+		// Observability failures must not alter provider-chain behavior.
 	}
 }
 
@@ -82,13 +97,17 @@ export async function summarizeWithFallback(
 	params: SummarizeParams,
 	options: FallbackOptions
 ): Promise<FallbackResult> {
+	if (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) {
+		throw new RangeError('timeoutMs must be a positive finite number');
+	}
+
 	const results: AttemptResult[] = [];
 
 	for (let index = 0; index < attempts.length; index += 1) {
 		const current = attempts[index];
 		if (current === undefined) continue;
 		const base = eventBase(current, index + 1);
-		options.onAttempt?.({type: 'start', ...base});
+		await emitAttempt(options.onAttempt, {type: 'start', ...base});
 
 		try {
 			const summary = await runWithTimeout(
@@ -97,19 +116,19 @@ export async function summarizeWithFallback(
 			);
 			const success: AttemptResult = {...base, outcome: 'success'};
 			results.push(success);
-			options.onAttempt?.({type: 'success', ...base});
+			await emitAttempt(options.onAttempt, {type: 'success', ...base});
 			return {
 				summary,
 				providerName: current.providerName,
 				model: current.model,
-				attempts: results,
+				attempts: immutableAttempts(results),
 			};
 		} catch (error) {
 			const reason: AttemptFailureReason = error instanceof ProviderTimeoutError
 				? 'TIMEOUT'
 				: 'PROVIDER_ERROR';
 			results.push({...base, outcome: 'failure', reason});
-			options.onAttempt?.({type: 'failure', ...base, reason});
+			await emitAttempt(options.onAttempt, {type: 'failure', ...base, reason});
 		}
 	}
 
