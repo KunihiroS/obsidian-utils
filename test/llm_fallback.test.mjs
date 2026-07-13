@@ -79,6 +79,34 @@ async function testFirstTwoFailuresFallBackToGemini() {
 	);
 }
 
+async function testNonErrorThrowFallsBackToNextProvider() {
+	const calls = [];
+	const result = await summarizeWithFallback([
+		attempt('openai', 'openai-model', async () => {
+			calls.push('openai');
+			throw {token: '«redacted:sk-…»'};
+		}),
+		attempt('codex', 'codex-model', async () => {
+			calls.push('codex');
+			return 'codex summary after non-Error';
+		}),
+	], params, {timeoutMs: 100});
+
+	assert.deepEqual(
+		{summary: result.summary, providerName: result.providerName, model: result.model, attempts: result.attempts, calls},
+		{
+			summary: 'codex summary after non-Error',
+			providerName: 'codex',
+			model: 'codex-model',
+			attempts: [
+				{attempt: 1, providerName: 'openai', model: 'openai-model', outcome: 'failure', reason: 'PROVIDER_ERROR'},
+				{attempt: 2, providerName: 'codex', model: 'codex-model', outcome: 'success'},
+			],
+			calls: ['openai', 'codex'],
+		}
+	);
+}
+
 async function testAllFailuresAreAggregatedWithoutRawErrors() {
 	const secret = 'sk-test-secret-value';
 	const events = [];
@@ -95,6 +123,10 @@ async function testAllFailuresAreAggregatedWithoutRawErrors() {
 		(error) => {
 			assert.equal(error.name, 'FallbackAggregateError');
 			assert.equal(error.message, 'All LLM provider attempts failed');
+			assert.deepEqual(error.attempts, [
+				{attempt: 1, providerName: 'openai', model: 'openai-model', outcome: 'failure', reason: 'PROVIDER_ERROR'},
+				{attempt: 2, providerName: 'codex', model: 'codex-model', outcome: 'failure', reason: 'PROVIDER_ERROR'},
+			]);
 			assert.equal('cause' in error, false);
 			assert.equal(JSON.stringify(error).includes(secret), false);
 			return true;
@@ -168,6 +200,7 @@ async function main() {
 	await run('primary success short-circuits', testPrimarySuccessShortCircuits);
 	await run('primary failure falls back to Codex', testPrimaryFailureFallsBackToCodex);
 	await run('first two failures fall back to Gemini', testFirstTwoFailuresFallBackToGemini);
+	await run('non-Error throw falls back to next provider', testNonErrorThrowFallsBackToNextProvider);
 	await run('all failures are safe and aggregated', testAllFailuresAreAggregatedWithoutRawErrors);
 	await run('timeout falls back to next provider', testTimeoutFallsBackToNextProvider);
 	await run('late completion is isolated', testLateCompletionCannotBecomeSuccessOrEmitSideEffects);
