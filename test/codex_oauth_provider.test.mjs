@@ -14,6 +14,7 @@ const {
 	CODEX_MAX_SSE_EVENTS,
 	CodexOAuthProvider,
 } = jiti('../src/llm/providers/codex_oauth_provider.ts');
+const {summarizeWithFallback} = jiti('../src/llm/fallback.ts');
 
 const ENDPOINT = 'https://chatgpt.com/backend-api/codex/responses';
 const RESOURCE_SENTINEL = 'raw-resource-limit-sentinel';
@@ -48,6 +49,14 @@ function completed(outputText = undefined) {
 
 function response(status, text, headers = {}) {
 	return {status, text, headers};
+}
+
+function deferred() {
+	let resolve;
+	const promise = new Promise((resolvePromise) => {
+		resolve = resolvePromise;
+	});
+	return {promise, resolve};
 }
 
 function providerWith({authReader = async () => auth(), replies = [response(200, sse([delta('summary'), completed()]))], model = 'codex-mini'} = {}) {
@@ -178,6 +187,108 @@ async function test401ReloadsSameAccountAndRetriesWithNewToken() {
 		schemes: ['Bearer', 'Bearer'],
 	});
 	assert.equal(requests[0].headers.Authorization === requests[1].headers.Authorization, false);
+}
+
+async function testAbortDuringFirstRequestStopsBefore401AuthReload() {
+	const firstHttp = deferred();
+	const controller = new AbortController();
+	let authReads = 0;
+	let httpRequests = 0;
+	const provider = new CodexOAuthProvider('model', {
+		authReader: async () => {
+			authReads++;
+			return auth(`token-${authReads}`, 'stable-account');
+		},
+		httpClient: async () => {
+			httpRequests++;
+			return await firstHttp.promise;
+		},
+	});
+
+	const summary = provider.summarize({...params, signal: controller.signal});
+	while (httpRequests === 0) await Promise.resolve();
+	controller.abort();
+	firstHttp.resolve(response(401, 'late unauthorized response'));
+
+	await rejectsWithCode(() => summary, 'CODEX_REQUEST_ABORTED');
+	assert.deepEqual({authReads, httpRequests}, {authReads: 1, httpRequests: 1});
+}
+
+async function testPreAbortedSignalSkipsAuthAndHttp() {
+	const controller = new AbortController();
+	controller.abort();
+	let authReads = 0;
+	let httpRequests = 0;
+	const provider = new CodexOAuthProvider('model', {
+		authReader: async () => {
+			authReads++;
+			return auth();
+		},
+		httpClient: async () => {
+			httpRequests++;
+			return response(200, 'unused');
+		},
+	});
+
+	await rejectsWithCode(() => provider.summarize({...params, signal: controller.signal}), 'CODEX_REQUEST_ABORTED');
+	assert.deepEqual({authReads, httpRequests}, {authReads: 0, httpRequests: 0});
+}
+
+async function testFallbackTimeoutPreventsLateCodex401SideEffectsAfterGeminiWins() {
+	const originalSetTimeout = globalThis.setTimeout;
+	const originalClearTimeout = globalThis.clearTimeout;
+	const firstHttp = deferred();
+	const codexSettled = deferred();
+	let timeoutCallback;
+	let authReads = 0;
+	let httpRequests = 0;
+	const codex = new CodexOAuthProvider('model', {
+		authReader: async () => {
+			authReads++;
+			return auth(`token-${authReads}`, 'stable-account');
+		},
+		httpClient: async () => {
+			httpRequests++;
+			return await firstHttp.promise;
+		},
+	});
+
+	globalThis.setTimeout = (callback) => {
+		timeoutCallback = callback;
+		return 1;
+	};
+	globalThis.clearTimeout = () => {};
+	try {
+		const fallback = summarizeWithFallback([
+			{
+				providerName: 'codex',
+				model: 'model',
+				provider: {
+					summarize: async (attemptParams) => {
+						try {
+							return await codex.summarize(attemptParams);
+						} finally {
+							codexSettled.resolve();
+						}
+					},
+				},
+			},
+			{providerName: 'gemini', model: 'gemini-model', provider: {summarize: async () => 'gemini summary'}},
+		], params, {timeoutMs: 10});
+		while (httpRequests === 0) await Promise.resolve();
+		timeoutCallback();
+		const result = await fallback;
+		firstHttp.resolve(response(401, 'late unauthorized response'));
+		await codexSettled.promise;
+
+		assert.deepEqual(
+			{summary: result.summary, providerName: result.providerName, authReads, httpRequests},
+			{summary: 'gemini summary', providerName: 'gemini', authReads: 1, httpRequests: 1}
+		);
+	} finally {
+		globalThis.setTimeout = originalSetTimeout;
+		globalThis.clearTimeout = originalClearTimeout;
+	}
 }
 
 async function test401AccountMismatchOrMissingDoesNotRetry() {
@@ -650,6 +761,9 @@ async function main() {
 	await run('cumulative output resource limit boundaries', testCumulativeOutputResourceLimitBoundaries);
 	await run('request contract and SSE success', testRequestContractAndSseSuccess);
 	await run('401 reloads same account and retries with new token', test401ReloadsSameAccountAndRetriesWithNewToken);
+	await run('abort during first request stops before 401 auth reload', testAbortDuringFirstRequestStopsBefore401AuthReload);
+	await run('pre-aborted signal skips auth and HTTP', testPreAbortedSignalSkipsAuthAndHttp);
+	await run('fallback timeout prevents late Codex 401 side effects after Gemini wins', testFallbackTimeoutPreventsLateCodex401SideEffectsAfterGeminiWins);
 	await run('401 account mismatch or missing does not retry', test401AccountMismatchOrMissingDoesNotRetry);
 	await run('second 401 stops without third request', testSecond401StopsWithoutThirdRequest);
 	await run('non-401 does not reload or retry', testNon401DoesNotReloadOrRetry);

@@ -58,12 +58,17 @@ function emitAttempt(
 	}
 }
 
-function runWithTimeout<T>(run: () => Promise<T>, timeoutMs: number): Promise<T> {
+function runWithTimeout<T>(
+	run: () => Promise<T>,
+	timeoutMs: number,
+	controller: AbortController
+): Promise<T> {
 	return new Promise<T>((resolve, reject) => {
 		let settled = false;
 		const timeout = setTimeout(() => {
 			if (settled) return;
 			settled = true;
+			controller.abort();
 			reject(new ProviderTimeoutError());
 		}, timeoutMs);
 
@@ -116,9 +121,11 @@ export async function summarizeWithFallback(
 		emitAttempt(options.onAttempt, {type: 'start', ...base});
 
 		try {
+			const controller = new AbortController();
 			const summary = await runWithTimeout(
-				() => current.provider.summarize(params),
-				options.timeoutMs
+				() => current.provider.summarize({...params, signal: controller.signal}),
+				options.timeoutMs,
+				controller
 			);
 			const success: AttemptResult = {...base, outcome: 'success'};
 			results.push(success);

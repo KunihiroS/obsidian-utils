@@ -75,6 +75,10 @@ function fail(code: string): CodexProviderError {
 	return new CodexProviderError(code);
 }
 
+function throwIfAborted(signal: AbortSignal | undefined): void {
+	if (signal?.aborted === true) throw fail('CODEX_REQUEST_ABORTED');
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -328,34 +332,52 @@ export class CodexOAuthProvider implements LlmProvider {
 	}
 
 	async summarize(params: SummarizeParams): Promise<string> {
-		const initialAuth = validateAuth(await this.readInitialAuth());
-		const first = await this.request(params, initialAuth);
+		throwIfAborted(params.signal);
+		const initialAuth = validateAuth(await this.readInitialAuth(params.signal));
+		throwIfAborted(params.signal);
+		const first = await this.request(params, initialAuth, params.signal);
+		throwIfAborted(params.signal);
 		if (first.status !== 401) return this.finish(first);
 
+		throwIfAborted(params.signal);
 		let reloadedAuth: CodexAuth;
 		try {
-			reloadedAuth = validateAuth(await this.authReader());
+			const auth = await this.authReader();
+			throwIfAborted(params.signal);
+			reloadedAuth = validateAuth(auth);
 		} catch {
+			throwIfAborted(params.signal);
 			throw fail('CODEX_AUTH_RELOAD_INVALID');
 		}
 		if (reloadedAuth.accountId !== initialAuth.accountId) {
 			throw fail('CODEX_AUTH_RELOAD_INVALID');
 		}
-		const second = await this.request(params, reloadedAuth);
+		throwIfAborted(params.signal);
+		const second = await this.request(params, reloadedAuth, params.signal);
+		throwIfAborted(params.signal);
 		if (second.status === 401) throw fail('CODEX_UNAUTHORIZED');
 		return this.finish(second);
 	}
 
-	private async readInitialAuth(): Promise<unknown> {
+	private async readInitialAuth(signal: AbortSignal | undefined): Promise<unknown> {
+		throwIfAborted(signal);
 		try {
-			return await this.authReader();
+			const auth = await this.authReader();
+			throwIfAborted(signal);
+			return auth;
 		} catch (error) {
+			throwIfAborted(signal);
 			if (error instanceof CodexProviderError) throw error;
 			throw fail('CODEX_AUTH_READ_FAILED');
 		}
 	}
 
-	private async request(params: SummarizeParams, auth: CodexAuth): Promise<RequestResult> {
+	private async request(
+		params: SummarizeParams,
+		auth: CodexAuth,
+		signal: AbortSignal | undefined
+	): Promise<RequestResult> {
+		throwIfAborted(signal);
 		let response: HttpResponse;
 		try {
 			response = await this.httpClient({
@@ -382,8 +404,10 @@ export class CodexOAuthProvider implements LlmProvider {
 				throw: false,
 			});
 		} catch {
+			throwIfAborted(signal);
 			throw fail('CODEX_REQUEST_FAILED');
 		}
+		throwIfAborted(signal);
 
 		let status: number;
 		try {

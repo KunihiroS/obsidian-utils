@@ -22,6 +22,14 @@ function delayWith(setTimeoutFn, milliseconds) {
 	return new Promise((resolve) => setTimeoutFn(resolve, milliseconds));
 }
 
+function deferred() {
+	let resolve;
+	const promise = new Promise((resolvePromise) => {
+		resolve = resolvePromise;
+	});
+	return {promise, resolve};
+}
+
 async function withTrackedTimeouts(run) {
 	const originalSetTimeout = globalThis.setTimeout;
 	const originalClearTimeout = globalThis.clearTimeout;
@@ -415,6 +423,64 @@ async function testTimeoutFallsBackToNextProvider() {
 	);
 }
 
+async function testTimeoutAbortsAttemptBeforeNextProviderStarts() {
+	const originalSetTimeout = globalThis.setTimeout;
+	const originalClearTimeout = globalThis.clearTimeout;
+	const primaryStarted = deferred();
+	let timeoutCallback;
+	let primarySignal;
+
+	globalThis.setTimeout = (callback) => {
+		timeoutCallback = callback;
+		return 1;
+	};
+	globalThis.clearTimeout = () => {};
+	try {
+		const fallback = summarizeWithFallback([
+			attempt('codex', 'codex-model', (attemptParams) => {
+				primarySignal = attemptParams.signal;
+				primaryStarted.resolve();
+				return new Promise(() => {});
+			}),
+			attempt('gemini', 'gemini-model', async (attemptParams) => {
+				assert.equal(primarySignal.aborted, true);
+				assert.equal(attemptParams.signal.aborted, false);
+				return 'gemini summary';
+			}),
+		], params, {timeoutMs: 10});
+
+		await primaryStarted.promise;
+		assert.equal(primarySignal instanceof AbortSignal, true);
+		timeoutCallback();
+		const result = await fallback;
+
+		assert.deepEqual(
+			{summary: result.summary, providerName: result.providerName, primaryAborted: primarySignal.aborted},
+			{summary: 'gemini summary', providerName: 'gemini', primaryAborted: true}
+		);
+	} finally {
+		globalThis.setTimeout = originalSetTimeout;
+		globalThis.clearTimeout = originalClearTimeout;
+	}
+}
+
+async function testSuccessfulAttemptSignalRemainsActiveWhileProviderRuns() {
+	let capturedSignal;
+	const result = await summarizeWithFallback([
+		attempt('openai', 'openai-model', async (attemptParams) => {
+			capturedSignal = attemptParams.signal;
+			assert.equal(capturedSignal.aborted, false);
+			await Promise.resolve();
+			assert.equal(capturedSignal.aborted, false);
+			return 'primary summary';
+		}),
+	], params, {timeoutMs: 100});
+
+	assert.equal(result.summary, 'primary summary');
+	assert.equal(capturedSignal instanceof AbortSignal, true);
+	assert.equal(capturedSignal.aborted, false);
+}
+
 async function testLateCompletionCannotBecomeSuccessOrEmitSideEffects() {
 	let resolvePrimary;
 	const primary = new Promise((resolve) => {
@@ -512,6 +578,8 @@ async function main() {
 	await run('non-Error throw falls back to next provider', testNonErrorThrowFallsBackToNextProvider);
 	await run('all failures are safe and aggregated', testAllFailuresAreAggregatedWithoutRawErrors);
 	await run('timeout falls back to next provider', testTimeoutFallsBackToNextProvider);
+	await run('timeout aborts attempt before next provider starts', testTimeoutAbortsAttemptBeforeNextProviderStarts);
+	await run('successful attempt signal remains active while provider runs', testSuccessfulAttemptSignalRemainsActiveWhileProviderRuns);
 	await run('late completion is isolated', testLateCompletionCannotBecomeSuccessOrEmitSideEffects);
 	await run('late primary rejection is consumed', testLatePrimaryRejectionIsConsumedAfterFallbackSuccess);
 	await run('provider timeout handles are cleared when attempts settle', testProviderTimeoutHandlesAreClearedWhenAttemptsSettle);
