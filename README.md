@@ -176,6 +176,14 @@ pnpm run dev
 pnpm run build
 ```
 
+### Lint
+
+```bash
+pnpm run lint
+```
+
+`eslint-suppressions.json` is a temporary, count-based baseline for pre-existing lint errors discovered during KUN-1036. New violations and increases beyond the recorded counts still fail lint. KUN-1040 owns removing the baseline; do not expand it for feature work.
+
 ### Manual install (local)
 
 Copy these files into your Vault:
