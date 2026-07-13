@@ -7,6 +7,7 @@ import jitiFactory from 'jiti';
 const jiti = jitiFactory(import.meta.url);
 const providerModule = jiti('../src/llm/createProvider.ts');
 const {createProviderChain} = providerModule;
+const {summarizeWithFallback} = jiti('../src/llm/fallback.ts');
 const params = {systemPrompt: 'Summarize safely.', userContent: '<html>paper</html>'};
 
 function provider(summary = 'summary') {
@@ -82,8 +83,204 @@ async function testCodexModelConfiguredTrimAndDefault() {
 				createCodex: () => provider(),
 				createGemini: () => provider(),
 			});
+			assert.equal(chain.length, 3);
 			assert.equal(chain[1].model, testCase.expected);
 		});
+	}
+}
+
+async function testFactoryExceptionsAreIsolatedWithoutRawValues() {
+	const secret = 'factory-secret-must-not-survive';
+	const thrownValues = [new Error(`constructor failed: ${secret}`), {token: secret}, secret];
+	const factoryCases = [
+		{factory: 'createOpenAi', attempt: 0, code: 'OPENAI_PROVIDER_CREATE_FAILED'},
+		{factory: 'createCodex', attempt: 1, code: 'CODEX_PROVIDER_CREATE_FAILED'},
+		{factory: 'createGemini', attempt: 2, code: 'GEMINI_PROVIDER_CREATE_FAILED'},
+	];
+
+	for (const factoryCase of factoryCases) {
+		for (const thrownValue of thrownValues) {
+			const chain = await createProviderChain(settings(), dependencies({
+				OPENAI_API_KEY: 'openai-key',
+				OPENAI_MODEL: 'openai-model',
+				CODEX_MODEL: 'codex-model',
+				GEMINI_API_KEY: 'gemini-key',
+				GEMINI_MODEL: 'gemini-model',
+			}, {
+				[factoryCase.factory]: () => {
+					throw thrownValue;
+				},
+			}));
+
+			assert.equal(chain.length, 3, factoryCase.factory);
+			const failedAttempt = chain[factoryCase.attempt];
+			assert.equal(
+				await rejectionCode(() => failedAttempt.provider.summarize(params)),
+				factoryCase.code,
+				factoryCase.factory
+			);
+			await assert.rejects(failedAttempt.provider.summarize(params), (error) => {
+				assert.equal(error instanceof Error, true);
+				assert.equal('cause' in error, false);
+				assert.equal(JSON.stringify(error).includes(secret), false);
+				assert.equal(error.message.includes(secret), false);
+				return true;
+			});
+		}
+	}
+}
+
+async function testFactoryFailureFallsBackToLaterProviderInFixedOrder() {
+	const calls = [];
+	const chain = await createProviderChain(settings(), dependencies({
+		OPENAI_API_KEY: 'openai-key',
+		OPENAI_MODEL: 'openai-model',
+		CODEX_MODEL: 'codex-model',
+		GEMINI_API_KEY: 'gemini-key',
+		GEMINI_MODEL: 'gemini-model',
+	}, {
+		createOpenAi: () => {
+			calls.push('construct-openai');
+			throw new Error('Authorization: Bearer factory-secret');
+		},
+		createCodex: () => ({summarize: async () => {
+			calls.push('summarize-codex');
+			return 'codex recovered summary';
+		}}),
+		createGemini: () => {
+			calls.push('construct-gemini');
+			return provider('unused');
+		},
+	}));
+
+	assert.equal(chain.length, 3);
+	const result = await summarizeWithFallback(chain, params, {timeoutMs: 100});
+	assert.deepEqual(
+		{summary: result.summary, providerName: result.providerName, attempts: result.attempts, calls},
+		{
+			summary: 'codex recovered summary',
+			providerName: 'codex',
+			attempts: [
+				{attempt: 1, providerName: 'openai', model: 'openai-model', outcome: 'failure', reason: 'PROVIDER_ERROR'},
+				{attempt: 2, providerName: 'codex', model: 'codex-model', outcome: 'success'},
+			],
+			calls: ['construct-openai', 'construct-gemini', 'summarize-codex'],
+		}
+	);
+}
+
+async function testInvalidConfiguredModelsAreSafeDeferredFailures() {
+	const invalidValues = [
+		{name: 'space', value: 'model with space'},
+		{name: 'newline', value: 'model\ninjected'},
+		{name: 'non-ASCII', value: 'モデル'},
+		{name: '257 characters', value: 'm'.repeat(257)},
+	];
+	const providerCases = [
+		{envKey: 'OPENAI_MODEL', factory: 'createOpenAi', attempt: 0, code: 'OPENAI_MODEL_INVALID'},
+		{envKey: 'CODEX_MODEL', factory: 'createCodex', attempt: 1, code: 'CODEX_MODEL_INVALID'},
+		{envKey: 'GEMINI_MODEL', factory: 'createGemini', attempt: 2, code: 'GEMINI_MODEL_INVALID'},
+	];
+
+	for (const providerCase of providerCases) {
+		for (const invalidValue of invalidValues) {
+			let invalidFactoryCalls = 0;
+			const env = {
+				OPENAI_API_KEY: 'openai-key',
+				OPENAI_MODEL: 'openai-model',
+				CODEX_MODEL: 'codex-model',
+				GEMINI_API_KEY: 'gemini-key',
+				GEMINI_MODEL: 'gemini-model',
+				[providerCase.envKey]: invalidValue.value,
+			};
+			const chain = await createProviderChain(settings(), dependencies(env, {
+				[providerCase.factory]: () => {
+					invalidFactoryCalls += 1;
+					return provider();
+				},
+			}));
+
+			assert.equal(chain.length, 3, `${providerCase.envKey}/${invalidValue.name}`);
+			const failedAttempt = chain[providerCase.attempt];
+			assert.equal(failedAttempt.model, '<invalid>', `${providerCase.envKey}/${invalidValue.name}`);
+			assert.equal(invalidFactoryCalls, 0, `${providerCase.envKey}/${invalidValue.name}`);
+			assert.equal(
+				await rejectionCode(() => failedAttempt.provider.summarize(params)),
+				providerCase.code,
+				`${providerCase.envKey}/${invalidValue.name}`
+			);
+			assert.equal(
+				[...failedAttempt.model].every((character) => {
+					const codePoint = character.codePointAt(0);
+					return codePoint !== undefined && codePoint >= 0x21 && codePoint <= 0x7e;
+				}),
+				true
+			);
+			assert.equal(failedAttempt.model.includes(invalidValue.value), false);
+		}
+	}
+}
+
+async function testEnvFileTabAndControlModelsAreSanitized() {
+	await withEnvFile([
+		'OPENAI_API_KEY=openai-key',
+		'OPENAI_MODEL="openai\tmodel"',
+		'CODEX_MODEL="codex\u0001model"',
+		'GEMINI_API_KEY=gemini-key',
+		'GEMINI_MODEL=gemini-model',
+	].join('\n'), async (envPath) => {
+		const calls = [];
+		const chain = await createProviderChain(settings(envPath), {
+			createOpenAi: () => {
+				calls.push('openai');
+				return provider();
+			},
+			createCodex: () => {
+				calls.push('codex');
+				return provider();
+			},
+			createGemini: () => provider(),
+		});
+
+		assert.equal(chain.length, 3);
+		assert.deepEqual(chain.slice(0, 2).map(({model}) => model), ['<invalid>', '<invalid>']);
+		assert.deepEqual(calls, []);
+		assert.equal(await rejectionCode(() => chain[0].provider.summarize(params)), 'OPENAI_MODEL_INVALID');
+		assert.equal(await rejectionCode(() => chain[1].provider.summarize(params)), 'CODEX_MODEL_INVALID');
+	});
+}
+
+async function testValidModelIdBoundaryAndCommonCharacters() {
+	const modelIds = ['vendor/model:v1.2_test-name+fast', 'm'.repeat(256)];
+	for (const modelId of modelIds) {
+		const received = [];
+		const chain = await createProviderChain(settings(), dependencies({
+			OPENAI_API_KEY: 'openai-key',
+			OPENAI_MODEL: modelId,
+			CODEX_MODEL: modelId,
+			GEMINI_API_KEY: 'gemini-key',
+			GEMINI_MODEL: modelId,
+		}, {
+			createOpenAi: (_apiKey, model) => {
+				received.push(['openai', model]);
+				return provider();
+			},
+			createCodex: (model) => {
+				received.push(['codex', model]);
+				return provider();
+			},
+			createGemini: (_apiKey, model) => {
+				received.push(['gemini', model]);
+				return provider();
+			},
+		}));
+
+		assert.equal(chain.length, 3);
+		assert.deepEqual(received, [
+			['openai', modelId],
+			['codex', modelId],
+			['gemini', modelId],
+		]);
 	}
 }
 
@@ -187,6 +384,7 @@ async function testCodexAuthIsLazyAtConstruction() {
 		}}),
 	}));
 
+	assert.equal(chain.length, 3);
 	assert.equal(authReads, 0);
 	assert.equal(await chain[1].provider.summarize(params), 'codex summary');
 	assert.equal(authReads, 1);
@@ -219,6 +417,11 @@ async function testManifestDeclaresDesktopOnly() {
 await testExportExists();
 await testFixedOrderAndMetadataIgnoreLegacySelector();
 await testCodexModelConfiguredTrimAndDefault();
+await testFactoryExceptionsAreIsolatedWithoutRawValues();
+await testFactoryFailureFallsBackToLaterProviderInFixedOrder();
+await testInvalidConfiguredModelsAreSafeDeferredFailures();
+await testEnvFileTabAndControlModelsAreSanitized();
+await testValidModelIdBoundaryAndCommonCharacters();
 await testMissingConfigurationIsDeferredPerAttempt();
 await testValidFactoriesReceiveTrimmedConfiguration();
 await testCodexAuthIsLazyAtConstruction();

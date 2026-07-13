@@ -12,7 +12,7 @@ export type ProviderCreateResult =
 	| {status: 'disabled'; reason: string}
 	| {status: 'enabled'; provider: LlmProvider; providerName: string; model: string};
 
-type ProviderChainDependencies = {
+export type ProviderChainDependencies = {
 	readEnv?: (envPath: string) => Promise<EnvVars>;
 	createOpenAi?: (apiKey: string, model: string) => LlmProvider;
 	createCodex?: (model: string) => LlmProvider;
@@ -25,6 +25,18 @@ function throwingProvider(code: string): LlmProvider {
 			throw new Error(code);
 		},
 	};
+}
+
+function isValidModel(model: string): boolean {
+	return model.length <= 256 && /^[!-~]+$/.test(model);
+}
+
+function createProviderOrFailure(factory: () => LlmProvider, failureCode: string): LlmProvider {
+	try {
+		return factory();
+	} catch {
+		return throwingProvider(failureCode);
+	}
 }
 
 export async function createProviderChain(
@@ -43,26 +55,45 @@ export async function createProviderChain(
 	const createOpenAi = dependencies.createOpenAi ?? ((apiKey, model) => new OpenAiChatProvider(apiKey, model));
 	const createCodex = dependencies.createCodex ?? ((model) => new CodexOAuthProvider(model));
 	const createGemini = dependencies.createGemini ?? ((apiKey, model) => new GeminiProvider(apiKey, model));
+	const openAiModelIsInvalid = openAiModel.length > 0 && !isValidModel(openAiModel);
+	const codexModelIsInvalid = !isValidModel(codexModel);
+	const geminiModelIsInvalid = geminiModel.length > 0 && !isValidModel(geminiModel);
 
 	return [
 		{
 			providerName: 'openai',
-			model: openAiModel,
+			model: openAiModelIsInvalid ? '<invalid>' : openAiModel,
 			provider: openAiModel.length === 0
 				? throwingProvider('OPENAI_MODEL_MISSING')
-				: openAiApiKey.length === 0
-					? throwingProvider('OPENAI_API_KEY_MISSING')
-					: createOpenAi(openAiApiKey, openAiModel),
+				: openAiModelIsInvalid
+					? throwingProvider('OPENAI_MODEL_INVALID')
+					: openAiApiKey.length === 0
+						? throwingProvider('OPENAI_API_KEY_MISSING')
+						: createProviderOrFailure(
+							() => createOpenAi(openAiApiKey, openAiModel),
+							'OPENAI_PROVIDER_CREATE_FAILED'
+						),
 		},
-		{providerName: 'codex', model: codexModel, provider: createCodex(codexModel)},
+		{
+			providerName: 'codex',
+			model: codexModelIsInvalid ? '<invalid>' : codexModel,
+			provider: codexModelIsInvalid
+				? throwingProvider('CODEX_MODEL_INVALID')
+				: createProviderOrFailure(() => createCodex(codexModel), 'CODEX_PROVIDER_CREATE_FAILED'),
+		},
 		{
 			providerName: 'gemini',
-			model: geminiModel,
+			model: geminiModelIsInvalid ? '<invalid>' : geminiModel,
 			provider: geminiApiKey.length === 0
 				? throwingProvider('GEMINI_API_KEY_MISSING')
 				: geminiModel.length === 0
 					? throwingProvider('GEMINI_MODEL_MISSING')
-					: createGemini(geminiApiKey, geminiModel),
+					: geminiModelIsInvalid
+						? throwingProvider('GEMINI_MODEL_INVALID')
+						: createProviderOrFailure(
+							() => createGemini(geminiApiKey, geminiModel),
+							'GEMINI_PROVIDER_CREATE_FAILED'
+						),
 		},
 	];
 }
