@@ -8,6 +8,7 @@ const jiti = jitiFactory(import.meta.url);
 const providerModule = jiti('../src/llm/createProvider.ts');
 const {createProviderChain} = providerModule;
 const {summarizeWithFallback} = jiti('../src/llm/fallback.ts');
+const {readEnvFileOrThrow} = jiti('../src/llm/env.ts');
 const params = {systemPrompt: 'Summarize safely.', userContent: '<html>paper</html>'};
 
 function provider(summary = 'summary') {
@@ -50,6 +51,18 @@ async function withEnvFile(content, test) {
 
 async function testExportExists() {
 	assert.equal(typeof createProviderChain, 'function');
+}
+
+async function testLegacyProviderSelectorIsRemoved() {
+	assert.equal(Object.hasOwn(providerModule, 'createProvider'), false);
+	await withEnvFile([
+		'LLM_PROVIDER=gemini',
+		'OPENAI_API_KEY=openai-key',
+		'OPENAI_MODEL=openai-model',
+	].join('\n'), async (envPath) => {
+		const env = await readEnvFileOrThrow(envPath);
+		assert.equal(Object.hasOwn(env, 'LLM_PROVIDER'), false);
+	});
 }
 
 async function testFixedOrderAndMetadataIgnoreLegacySelector() {
@@ -415,6 +428,7 @@ async function testManifestDeclaresDesktopOnly() {
 }
 
 await testExportExists();
+await testLegacyProviderSelectorIsRemoved();
 await testFixedOrderAndMetadataIgnoreLegacySelector();
 await testCodexModelConfiguredTrimAndDefault();
 await testFactoryExceptionsAreIsolatedWithoutRawValues();

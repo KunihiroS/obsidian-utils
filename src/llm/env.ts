@@ -1,10 +1,7 @@
 import * as fs from 'fs/promises';
 import {formatErrorForLog} from '../logger';
 
-export type LlmProviderName = 'openai' | 'gemini';
-
 export type EnvVars = {
-	LLM_PROVIDER?: LlmProviderName;
 	OPENAI_API_KEY?: string;
 	OPENAI_MODEL?: string;
 	CODEX_MODEL?: string;
@@ -36,13 +33,6 @@ function parseDotEnv(content: string): Record<string, string> {
 	return vars;
 }
 
-function coerceProviderName(value: string | undefined): LlmProviderName | undefined {
-	const v = (value ?? '').trim().toLowerCase();
-	if (v === 'openai') return 'openai';
-	if (v === 'gemini') return 'gemini';
-	return undefined;
-}
-
 export async function readEnvFileOrThrow(envPath: string): Promise<EnvVars> {
 	let content: string;
 	try {
@@ -54,7 +44,6 @@ export async function readEnvFileOrThrow(envPath: string): Promise<EnvVars> {
 
 	const vars = parseDotEnv(content);
 	return {
-		LLM_PROVIDER: coerceProviderName(vars.LLM_PROVIDER),
 		OPENAI_API_KEY: vars.OPENAI_API_KEY,
 		OPENAI_MODEL: vars.OPENAI_MODEL,
 		CODEX_MODEL: vars.CODEX_MODEL,

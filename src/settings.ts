@@ -87,8 +87,8 @@ export class SampleSettingTab extends PluginSettingTab {
 				}));
 
 		new Setting(containerEl)
-			.setName('AI request timeout (seconds)')
-			.setDesc('Timeout in seconds for LLM API requests. Default: 180. Must be a positive integer.')
+			.setName('Provider attempt timeout (seconds)')
+			.setDesc('Timeout for each provider attempt in seconds. Default: 180. Must be a positive, supported value.')
 			.addText(text => text
 				.setPlaceholder('180')
 				.setValue(String(this.plugin.settings.llmTimeoutSec))

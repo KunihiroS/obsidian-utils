@@ -43,15 +43,15 @@ main.ts (orchestrator)
 | `src/logger.ts` | Structured key=value log blocks, appended to daily log files, redacts secrets |
 | `src/llm/types.ts` | `LlmProvider` interface (`summarize()`) |
 | `src/llm/env.ts` | Read external `.env` file (Vault-external, absolute path) |
-| `src/llm/createProvider.ts` | Factory: reads `.env`, returns enabled/disabled provider result |
-| `src/llm/providers/` | Concrete providers: `openai_chat_provider.ts`, `gemini_provider.ts` |
+| `src/llm/createProvider.ts` | Builds the fixed OpenAI → Codex → Gemini provider chain from `.env` |
+| `src/llm/providers/` | Concrete providers: `openai_chat_provider.ts`, `codex_oauth_provider.ts`, `gemini_provider.ts` |
 
 ### Key design decisions
 
 - **LLM credentials** live in an external `.env` file (absolute path configured in settings), never inside the Vault.
 - **Summary blocks** are wrapped in `<!-- paper_extractor:summary:start/end -->` markers, making re-runs idempotent (replace rather than append).
 - **Attachment folder** mirrors the note path: note at `path/to/Title.md` → attachments at `path/to/Title/<arxivId>.html/.pdf`.
-- **`createProvider`** returns `{status:'disabled', reason}` for non-fatal skips (missing model, disabled) vs. throwing for hard misconfigurations (missing API key).
+- **`createProviderChain`** always attempts providers in the fixed OpenAI API key → Codex OAuth → Gemini API key order; missing configuration and provider failures fall through to the next attempt.
 - **`isDesktopOnly: true`** in `manifest.json` — uses Node/filesystem APIs not available on mobile.
 
 ## TypeScript strictness

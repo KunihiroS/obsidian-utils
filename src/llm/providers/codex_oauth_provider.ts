@@ -1,5 +1,4 @@
 /* Safe auth-file access intentionally requires Node.js POSIX filesystem APIs. */
-/* eslint-disable import/no-nodejs-modules */
 import {constants as fsConstants} from 'fs';
 import {open as openFile} from 'fs/promises';
 import {Buffer} from 'buffer';
