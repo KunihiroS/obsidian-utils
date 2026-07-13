@@ -168,10 +168,6 @@ export async function generateSummary(
 		try {
 			providerChain = await dependencies.createProviderChain(settings);
 		} catch (e) {
-			const info = formatErrorForLog(e);
-			errorName = info.errorName;
-			errorCode = info.errorCode;
-			errorSummary = info.errorSummary;
 			const errorToken = e instanceof Error ? e.message.trim().split(/\s+/, 1)[0] : '';
 			if (errorToken === 'ENV_PATH_MISSING') {
 				reason = 'ENV_PATH_MISSING';

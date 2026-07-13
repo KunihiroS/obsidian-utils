@@ -575,6 +575,9 @@ async function testInvalidTimeoutFailsBeforeChainAndProviderAttempts() {
 }
 
 async function testMissingEnvPathRetainsSpecificDiagnosticsWithoutProviderOrNoteWork() {
+	const privateName = 'private-env-path-error-name';
+	const privateCode = 'tenant-env-path-secret-code';
+	const privateMessage = 'db-password hunter2-env-path-private-value';
 	const providerCalls = [];
 	const harness = createHarness({
 		chain: [attempt('openai', 'must-not-run', async () => {
@@ -583,7 +586,10 @@ async function testMissingEnvPathRetainsSpecificDiagnosticsWithoutProviderOrNote
 		})],
 		dependencies: {
 			createProviderChain: async () => {
-				throw new Error('ENV_PATH_MISSING');
+				const error = new Error(`ENV_PATH_MISSING ${privateMessage}`);
+				error.name = privateName;
+				error.code = privateCode;
+				throw error;
 			},
 		},
 	});
@@ -599,10 +605,19 @@ async function testMissingEnvPathRetainsSpecificDiagnosticsWithoutProviderOrNote
 		duration: 10000,
 	});
 	assert.equal(harness.notices.some(({message}) => message.includes('Error:')), false);
-	assert.match(finalLog(harness.logs), /result=NG reason=ENV_PATH_MISSING(?: |$)/);
+	const final = finalLog(harness.logs);
+	assert.match(final, /result=NG reason=ENV_PATH_MISSING(?: |$)/);
+	assert.equal(/(?:^| )error(?:Name|Code|Summary)=/.test(final), false, 'env path failure retained exception metadata');
+	for (const privateFragment of [privateName, privateCode, privateMessage, 'hunter2-env-path-private-value']) {
+		assert.equal(harness.logs.join('\n').includes(privateFragment), false, `logs leaked env path exception fragment: ${privateFragment}`);
+		assert.equal(harness.notices.some(({message}) => message.includes(privateFragment)), false, `notice leaked env path exception fragment: ${privateFragment}`);
+	}
 }
 
-async function testEnvReadFailureRetainsSafeMetadataWithoutProviderOrNoteWork() {
+async function testEnvReadFailureRetainsReasonWithoutExceptionMetadataOrProviderOrNoteWork() {
+	const privateName = 'private-env-read-error-name';
+	const privateCode = 'tenant-env-read-secret-code';
+	const privateMessage = 'db-password hunter2-env-read-private-value';
 	const providerCalls = [];
 	const harness = createHarness({
 		chain: [attempt('openai', 'must-not-run', async () => {
@@ -611,7 +626,10 @@ async function testEnvReadFailureRetainsSafeMetadataWithoutProviderOrNoteWork() 
 		})],
 		dependencies: {
 			createProviderChain: async () => {
-				throw new Error('ENV_READ_FAILED SafeError unavailable');
+				const error = new Error(`ENV_READ_FAILED ${privateMessage}`);
+				error.name = privateName;
+				error.code = privateCode;
+				throw error;
 			},
 		},
 	});
@@ -626,15 +644,20 @@ async function testEnvReadFailureRetainsSafeMetadataWithoutProviderOrNoteWork() 
 		message: 'Failed to read env file.',
 		duration: 10000,
 	});
-	assert.equal(harness.notices.some(({message}) => message.includes('SafeError unavailable')), false);
-	const fields = parseLogFields(finalLog(harness.logs));
+	const final = finalLog(harness.logs);
+	const fields = parseLogFields(final);
 	assert.equal(fields.reason, 'ENV_READ_FAILED');
-	assert.equal(fields.errorName, 'Error');
-	assert.equal(fields.errorSummary, 'ENV_READ_FAILED_SafeError_unavailable');
+	assert.equal(/(?:^| )error(?:Name|Code|Summary)=/.test(final), false, 'env read failure retained exception metadata');
+	for (const privateFragment of [privateName, privateCode, privateMessage, 'hunter2-env-read-private-value']) {
+		assert.equal(harness.logs.join('\n').includes(privateFragment), false, `logs leaked env read exception fragment: ${privateFragment}`);
+		assert.equal(harness.notices.some(({message}) => message.includes(privateFragment)), false, `notice leaked env read exception fragment: ${privateFragment}`);
+	}
 }
 
-async function testUnexpectedProviderChainErrorStaysGenericAndRedacted() {
-	const secret = `sk-${'s'.repeat(24)}`;
+async function testUnexpectedProviderChainErrorOmitsAllExceptionMetadata() {
+	const privateName = 'private-error-name';
+	const privateCode = 'tenant-secret-code';
+	const privateMessage = 'UNEXPECTED db-password hunter2-private-value';
 	const providerCalls = [];
 	const harness = createHarness({
 		chain: [attempt('openai', 'must-not-run', async () => {
@@ -643,7 +666,10 @@ async function testUnexpectedProviderChainErrorStaysGenericAndRedacted() {
 		})],
 		dependencies: {
 			createProviderChain: async () => {
-				throw new Error(`UNEXPECTED ${secret}`);
+				const error = new Error(privateMessage);
+				error.name = privateName;
+				error.code = privateCode;
+				throw error;
 			},
 		},
 	});
@@ -660,9 +686,11 @@ async function testUnexpectedProviderChainErrorStaysGenericAndRedacted() {
 	});
 	const final = finalLog(harness.logs);
 	assert.match(final, /result=NG reason=PROVIDER_CHAIN_CREATE_FAILED(?: |$)/);
-	assert.equal(final.includes(secret), false, 'final metadata leaked provider-chain secret');
-	assert.equal(harness.logs.join('\n').includes(secret), false, 'logs leaked provider-chain secret');
-	assert.equal(harness.notices.some(({message}) => message.includes(secret)), false, 'notice leaked provider-chain secret');
+	assert.equal(/(?:^| )error(?:Name|Code|Summary)=/.test(final), false, 'unknown provider-chain failure retained exception metadata');
+	for (const privateFragment of [privateName, privateCode, privateMessage, 'db-password', 'hunter2-private-value']) {
+		assert.equal(harness.logs.join('\n').includes(privateFragment), false, `logs leaked provider-chain exception fragment: ${privateFragment}`);
+		assert.equal(harness.notices.some(({message}) => message.includes(privateFragment)), false, `notice leaked provider-chain exception fragment: ${privateFragment}`);
+	}
 }
 
 async function testWaitIntervalAlwaysClearedAfterItStarts() {
@@ -713,8 +741,8 @@ async function main() {
 	await run('moved original object is not read or modified after provider success', testMovedOriginalObjectIsNotReadOrModifiedAfterProviderSuccess);
 	await run('invalid timeout fails before chain construction', testInvalidTimeoutFailsBeforeChainAndProviderAttempts);
 	await run('missing env path retains specific diagnostics without provider or note work', testMissingEnvPathRetainsSpecificDiagnosticsWithoutProviderOrNoteWork);
-	await run('env read failure retains safe metadata without provider or note work', testEnvReadFailureRetainsSafeMetadataWithoutProviderOrNoteWork);
-	await run('unexpected provider-chain error stays generic and redacted', testUnexpectedProviderChainErrorStaysGenericAndRedacted);
+	await run('env read failure retains reason without exception metadata or provider or note work', testEnvReadFailureRetainsReasonWithoutExceptionMetadataOrProviderOrNoteWork);
+	await run('unexpected provider-chain error omits all exception metadata', testUnexpectedProviderChainErrorOmitsAllExceptionMetadata);
 	await run('wait interval is always cleared after starting', testWaitIntervalAlwaysClearedAfterItStarts);
 	console.log('summary_generator_fallback integration tests passed');
 }
