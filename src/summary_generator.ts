@@ -78,7 +78,7 @@ export async function generateSummary(
 	const logBlock: LogBlock = await dependencies.startLogBlock(
 		app,
 		logDir,
-		`component=summary_generator notePath=${noteFile.path} noteBaseName=${noteFile.basename} id=${id}`
+		`component=summary_generator notePath=${safeLogMetadataValue(noteFile.path)} noteBaseName=${safeLogMetadataValue(noteFile.basename)} id=${id}`
 	);
 
 	let reason = '';
@@ -209,7 +209,7 @@ export async function generateSummary(
 
 		dependencies.notice('(4/4) Writing note.');
 		const latestFile = app.vault.getAbstractFileByPath(noteFile.path);
-		if (!dependencies.isTFile(latestFile)) {
+		if (latestFile !== noteFile || !dependencies.isTFile(latestFile)) {
 			reason = 'NOTE_MOVED_OR_DELETED';
 			dependencies.notice('Target note was moved or deleted.', 10000);
 			return;
@@ -254,11 +254,13 @@ export async function generateSummary(
 		const safeReason = safeLogMetadataValue(reason || (result === 'OK' ? 'OK' : 'UNKNOWN'));
 		const safeProvider = safeLogMetadataValue(providerName);
 		const safeModel = safeLogMetadataValue(model);
+		const safeHtmlPath = safeLogMetadataValue(htmlPath);
+		const safePromptPath = safeLogMetadataValue(promptPath);
 		if (result === 'OK') {
 			await dependencies.endLogBlock(
 				app,
 				logBlock,
-				`result=OK reason=${safeReason} htmlPath=${htmlPath} provider=${safeProvider} model=${safeModel} summaryChars=${summaryChars}`
+				`result=OK reason=${safeReason} htmlPath=${safeHtmlPath} provider=${safeProvider} model=${safeModel} summaryChars=${summaryChars}`
 			);
 		} else {
 			const errorPart = errorName.length > 0 || errorCode.length > 0 || errorSummary.length > 0
@@ -267,7 +269,7 @@ export async function generateSummary(
 			await dependencies.endLogBlock(
 				app,
 				logBlock,
-				`result=NG reason=${safeReason} htmlPath=${htmlPath} promptPath=${promptPath} provider=${safeProvider} model=${safeModel}${errorPart}`
+				`result=NG reason=${safeReason} htmlPath=${safeHtmlPath} promptPath=${safePromptPath} provider=${safeProvider} model=${safeModel}${errorPart}`
 			);
 		}
 	}

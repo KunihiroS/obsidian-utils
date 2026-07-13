@@ -25,7 +25,7 @@ function attempt(providerName, model, summarize) {
 
 function createHarness(overrides = {}) {
 	let noteText = overrides.noteText ?? '# Test Paper\n\nBody';
-	const noteFile = {
+	const noteFile = overrides.noteFile ?? {
 		path: 'Papers/Test Paper.md',
 		basename: 'Test Paper',
 		parent: {path: 'Papers'},
@@ -453,6 +453,79 @@ async function testLocalErrorMetadataCannotForgeFinalNgLogFields() {
 	}
 }
 
+async function testMaliciousSummaryPathsCannotForgeStartOrFinalLogFields() {
+	const noteSecret = `sk-${'n'.repeat(24)}`;
+	const promptSecret = `ghp_${'p'.repeat(24)}`;
+	const maliciousBaseName = `Paper\tresult=OK noteSecret=${noteSecret}=${'b'.repeat(1500)}`;
+	const maliciousNotePath = `Papers/${maliciousBaseName}\nresult=OK forged=start.md`;
+	const maliciousHtmlPath = `Papers/${maliciousBaseName}/2501.12345.html`;
+	const maliciousPromptPath = `prompts/summary\nresult=OK promptSecret=${promptSecret}=${'q'.repeat(1500)}.md`;
+	const harness = createHarness({
+		noteFile: {
+			path: maliciousNotePath,
+			basename: maliciousBaseName,
+			parent: {path: 'Papers'},
+		},
+		settings: {systemPromptPath: maliciousPromptPath},
+		adapterFiles: {
+			[maliciousHtmlPath]: '<html><article>paper body</article></html>',
+			[maliciousPromptPath]: 'Summarize in Japanese.',
+		},
+		noteReadError: new Error('fixed local read failure'),
+		chain: [attempt('openai', 'model', async () => 'safe summary')],
+	});
+
+	await runSummary(harness);
+
+	assertSingleLineBoundedLogs(harness.logs);
+	assert.equal(harness.logs.join('\n').includes(noteSecret), false, 'logs leaked note path secret');
+	assert.equal(harness.logs.join('\n').includes(promptSecret), false, 'logs leaked prompt path secret');
+	assert.equal(harness.logs[0].match(/(?:^| )result=OK(?: |$)/g)?.length ?? 0, 0, 'start log forged result=OK');
+	assert.equal(finalLog(harness.logs).match(/(?:^| )result=OK(?: |$)/g)?.length ?? 0, 0, 'final log forged result=OK');
+	assert.equal(finalLog(harness.logs).match(/(?:^| )result=NG(?: |$)/g)?.length ?? 0, 1, 'final log must have one result=NG');
+	const startFields = parseLogFields(harness.logs[0]);
+	const endFields = parseLogFields(finalLog(harness.logs));
+	for (const [name, value] of Object.entries({
+		notePath: startFields.notePath,
+		noteBaseName: startFields.noteBaseName,
+		htmlPath: endFields.htmlPath,
+		promptPath: endFields.promptPath,
+	})) {
+		assert.ok(value.length <= 128, `${name} exceeded metadata bound: ${value.length}`);
+	}
+}
+
+async function testSamePathReplacementIsNotReadOrModifiedAfterProviderSuccess() {
+	const replacementFile = {
+		path: 'Papers/Test Paper.md',
+		basename: 'Test Paper',
+		parent: {path: 'Papers'},
+	};
+	const providerCalls = [];
+	const harness = createHarness({
+		latestFile: replacementFile,
+		chain: [
+			attempt('openai', 'winner', async () => {
+				providerCalls.push('summarize:openai');
+				return 'accepted summary';
+			}),
+			attempt('codex', 'must-not-run', async () => {
+				providerCalls.push('summarize:codex');
+				return 'incorrect retry';
+			}),
+		],
+		dependencies: {isTFile: (file) => file === replacementFile || file?.path === 'Papers/Test Paper.md'},
+	});
+
+	await runSummary(harness);
+
+	assert.deepEqual(providerCalls, ['summarize:openai']);
+	assert.equal(harness.calls.some((call) => call.startsWith('vault.read:')), false);
+	assert.equal(harness.calls.some((call) => call.startsWith('vault.modify:')), false);
+	assert.deepEqual(harness.modifications, []);
+	assert.match(finalLog(harness.logs), /result=NG reason=NOTE_MOVED_OR_DELETED(?: |$)/);
+}
+
 async function testInvalidTimeoutFailsBeforeChainAndProviderAttempts() {
 	for (const timeout of [0, -1, Number.NaN, MAX_TIMEOUT_SEC + 1, Number.POSITIVE_INFINITY]) {
 		const calls = [];
@@ -516,6 +589,8 @@ async function main() {
 	await run('post-provider note failures do not retry later providers', testPostProviderNoteFailuresDoNotRunLaterProviders);
 	await run('malicious provider metadata cannot forge logs', testMaliciousProviderMetadataCannotForgeLogEntries);
 	await run('local error metadata cannot forge final NG log fields', testLocalErrorMetadataCannotForgeFinalNgLogFields);
+	await run('malicious summary paths cannot forge start or final log fields', testMaliciousSummaryPathsCannotForgeStartOrFinalLogFields);
+	await run('same-path replacement is not read or modified after provider success', testSamePathReplacementIsNotReadOrModifiedAfterProviderSuccess);
 	await run('invalid timeout fails before chain construction', testInvalidTimeoutFailsBeforeChainAndProviderAttempts);
 	await run('wait interval is always cleared after starting', testWaitIntervalAlwaysClearedAfterItStarts);
 	console.log('summary_generator_fallback integration tests passed');
