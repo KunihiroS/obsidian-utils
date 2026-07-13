@@ -167,9 +167,22 @@ export async function generateSummary(
 		let providerChain;
 		try {
 			providerChain = await dependencies.createProviderChain(settings);
-		} catch {
-			reason = 'PROVIDER_CHAIN_CREATE_FAILED';
-			dependencies.notice('LLM provider chain could not be created.', 10000);
+		} catch (e) {
+			const info = formatErrorForLog(e);
+			errorName = info.errorName;
+			errorCode = info.errorCode;
+			errorSummary = info.errorSummary;
+			const errorToken = e instanceof Error ? e.message.trim().split(/\s+/, 1)[0] : '';
+			if (errorToken === 'ENV_PATH_MISSING') {
+				reason = 'ENV_PATH_MISSING';
+				dependencies.notice('envPath is required (Settings).', 10000);
+			} else if (errorToken === 'ENV_READ_FAILED') {
+				reason = 'ENV_READ_FAILED';
+				dependencies.notice('Failed to read env file.', 10000);
+			} else {
+				reason = 'PROVIDER_CHAIN_CREATE_FAILED';
+				dependencies.notice('LLM provider chain could not be created.', 10000);
+			}
 			return;
 		}
 

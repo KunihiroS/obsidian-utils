@@ -574,6 +574,97 @@ async function testInvalidTimeoutFailsBeforeChainAndProviderAttempts() {
 	}
 }
 
+async function testMissingEnvPathRetainsSpecificDiagnosticsWithoutProviderOrNoteWork() {
+	const providerCalls = [];
+	const harness = createHarness({
+		chain: [attempt('openai', 'must-not-run', async () => {
+			providerCalls.push('summarize:openai');
+			return 'must not be written';
+		})],
+		dependencies: {
+			createProviderChain: async () => {
+				throw new Error('ENV_PATH_MISSING');
+			},
+		},
+	});
+
+	await runSummary(harness);
+
+	assert.deepEqual(providerCalls, []);
+	assert.equal(harness.calls.some((call) => call.startsWith('vault.read:')), false);
+	assert.equal(harness.calls.some((call) => call.startsWith('vault.modify:')), false);
+	assert.deepEqual(harness.modifications, []);
+	assert.deepEqual(harness.notices.at(-1), {
+		message: 'envPath is required (Settings).',
+		duration: 10000,
+	});
+	assert.equal(harness.notices.some(({message}) => message.includes('Error:')), false);
+	assert.match(finalLog(harness.logs), /result=NG reason=ENV_PATH_MISSING(?: |$)/);
+}
+
+async function testEnvReadFailureRetainsSafeMetadataWithoutProviderOrNoteWork() {
+	const providerCalls = [];
+	const harness = createHarness({
+		chain: [attempt('openai', 'must-not-run', async () => {
+			providerCalls.push('summarize:openai');
+			return 'must not be written';
+		})],
+		dependencies: {
+			createProviderChain: async () => {
+				throw new Error('ENV_READ_FAILED SafeError unavailable');
+			},
+		},
+	});
+
+	await runSummary(harness);
+
+	assert.deepEqual(providerCalls, []);
+	assert.equal(harness.calls.some((call) => call.startsWith('vault.read:')), false);
+	assert.equal(harness.calls.some((call) => call.startsWith('vault.modify:')), false);
+	assert.deepEqual(harness.modifications, []);
+	assert.deepEqual(harness.notices.at(-1), {
+		message: 'Failed to read env file.',
+		duration: 10000,
+	});
+	assert.equal(harness.notices.some(({message}) => message.includes('SafeError unavailable')), false);
+	const fields = parseLogFields(finalLog(harness.logs));
+	assert.equal(fields.reason, 'ENV_READ_FAILED');
+	assert.equal(fields.errorName, 'Error');
+	assert.equal(fields.errorSummary, 'ENV_READ_FAILED_SafeError_unavailable');
+}
+
+async function testUnexpectedProviderChainErrorStaysGenericAndRedacted() {
+	const secret = `sk-${'s'.repeat(24)}`;
+	const providerCalls = [];
+	const harness = createHarness({
+		chain: [attempt('openai', 'must-not-run', async () => {
+			providerCalls.push('summarize:openai');
+			return 'must not be written';
+		})],
+		dependencies: {
+			createProviderChain: async () => {
+				throw new Error(`UNEXPECTED ${secret}`);
+			},
+		},
+	});
+
+	await runSummary(harness);
+
+	assert.deepEqual(providerCalls, []);
+	assert.equal(harness.calls.some((call) => call.startsWith('vault.read:')), false);
+	assert.equal(harness.calls.some((call) => call.startsWith('vault.modify:')), false);
+	assert.deepEqual(harness.modifications, []);
+	assert.deepEqual(harness.notices.at(-1), {
+		message: 'LLM provider chain could not be created.',
+		duration: 10000,
+	});
+	const final = finalLog(harness.logs);
+	assert.match(final, /result=NG reason=PROVIDER_CHAIN_CREATE_FAILED(?: |$)/);
+	assert.equal(final.includes(secret), false, 'final metadata leaked provider-chain secret');
+	assert.equal(harness.logs.join('\n').includes(secret), false, 'logs leaked provider-chain secret');
+	assert.equal(harness.notices.some(({message}) => message.includes(secret)), false, 'notice leaked provider-chain secret');
+}
+
 async function testWaitIntervalAlwaysClearedAfterItStarts() {
 	const cases = [
 		{
@@ -621,6 +712,9 @@ async function main() {
 	await run('same-path replacement is not read or modified after provider success', testSamePathReplacementIsNotReadOrModifiedAfterProviderSuccess);
 	await run('moved original object is not read or modified after provider success', testMovedOriginalObjectIsNotReadOrModifiedAfterProviderSuccess);
 	await run('invalid timeout fails before chain construction', testInvalidTimeoutFailsBeforeChainAndProviderAttempts);
+	await run('missing env path retains specific diagnostics without provider or note work', testMissingEnvPathRetainsSpecificDiagnosticsWithoutProviderOrNoteWork);
+	await run('env read failure retains safe metadata without provider or note work', testEnvReadFailureRetainsSafeMetadataWithoutProviderOrNoteWork);
+	await run('unexpected provider-chain error stays generic and redacted', testUnexpectedProviderChainErrorStaysGenericAndRedacted);
 	await run('wait interval is always cleared after starting', testWaitIntervalAlwaysClearedAfterItStarts);
 	console.log('summary_generator_fallback integration tests passed');
 }
