@@ -57,11 +57,34 @@ function providerWith({authReader = async () => auth(), replies = [response(200,
 	return {provider, requests};
 }
 
+function containsSecret(value, seen = new WeakSet()) {
+	if (typeof value === 'string') return SECRET_VALUES.some((secret) => value.includes(secret));
+	if (value === null || (typeof value !== 'object' && typeof value !== 'function')) {
+		try {
+			const rendered = JSON.stringify(value);
+			return typeof rendered === 'string' && SECRET_VALUES.some((secret) => rendered.includes(secret));
+		} catch {
+			return false;
+		}
+	}
+	if (seen.has(value)) return false;
+	seen.add(value);
+	for (const key of Reflect.ownKeys(value)) {
+		let descriptor;
+		try {
+			descriptor = Object.getOwnPropertyDescriptor(value, key);
+		} catch {
+			continue;
+		}
+		if (descriptor && Object.hasOwn(descriptor, 'value') && containsSecret(descriptor.value, seen)) return true;
+	}
+	return false;
+}
+
 async function rejectsWithCode(action, code) {
 	await assert.rejects(action, (error) => {
 		assert.equal(error instanceof Error ? error.message : error, code);
-		const rendered = String(error);
-		for (const secret of SECRET_VALUES) assert.equal(rendered.includes(secret), false);
+		assert.equal(containsSecret(error), false, 'provider error leaked a secret');
 		return true;
 	});
 }
@@ -199,6 +222,44 @@ async function testInjectedAuthValidation() {
 		await rejectsWithCode(() => provider.summarize(params), testCase.code);
 		assert.equal(requests.length, 0);
 	}
+}
+
+async function testUnsafeAccessTokensAreRejectedBeforeHttpRequest() {
+	const invalidTokens = [
+		'',
+		'token\r\nInjected: header',
+		'token	value',
+		' token',
+		'token ',
+		'tok en',
+		'tokén',
+		'tok=en',
+		'x'.repeat(16_385),
+	];
+	for (const accessToken of invalidTokens) {
+		const {provider, requests} = providerWith({authReader: async () => auth(accessToken, 'safe-account')});
+		let error;
+		try {
+			await provider.summarize(params);
+		} catch (caught) {
+			error = caught;
+		}
+		if (error !== undefined) assert.equal(containsSecret(error), false, 'provider error leaked a secret');
+		assert.deepEqual({
+			code: error instanceof Error ? error.message : error,
+			requestCount: requests.length,
+		}, {
+			code: 'CODEX_AUTH_ACCESS_TOKEN_INVALID',
+			requestCount: 0,
+		});
+	}
+}
+
+async function testMaximumLengthSafeAccessTokenIsAccepted() {
+	const accessToken = 'Ab0._~+/-'.padEnd(16_382, 'A') + '==';
+	const {provider, requests} = providerWith({authReader: async () => auth(accessToken, 'safe-account')});
+	assert.equal(await provider.summarize(params), 'summary');
+	assert.equal(requests.length, 1);
 }
 
 async function testAuthJsonShapeValidationAndUnknownFields() {
@@ -396,6 +457,55 @@ async function testSseFailureBoundaries() {
 	}
 }
 
+async function testDuplicateCompletedIsRejected() {
+	const body = sse([completed('first'), completed('second')]);
+	const {provider} = providerWith({replies: [response(200, body)]});
+	await rejectsWithCode(() => provider.summarize(params), 'CODEX_RESPONSE_SEQUENCE_INVALID');
+}
+
+async function testSemanticEventsAfterCompletedAreRejected() {
+	const trailingEvents = [
+		delta('late'),
+		['event: error', 'data: {"type":"error"}'],
+		['event: future.event', 'data: {"type":"future.event"}'],
+	];
+	for (const trailingEvent of trailingEvents) {
+		const body = sse([completed('final'), trailingEvent]);
+		const {provider} = providerWith({replies: [response(200, body)]});
+		await rejectsWithCode(() => provider.summarize(params), 'CODEX_RESPONSE_SEQUENCE_INVALID');
+	}
+}
+
+async function testDoneHardTerminatesAndIgnoresAllFollowingBytes() {
+	const body = sse([
+		completed('final output'),
+		['data: [DONE]'],
+		delta('late'),
+		['event: error', 'data: {"type":"error"}'],
+		['data: {malformed'],
+	]);
+	const {provider} = providerWith({replies: [response(200, body)]});
+	assert.equal(await provider.summarize(params), 'final output');
+}
+
+async function testDoneBeforeCompletedRemainsIncomplete() {
+	const body = sse([['data: [DONE]'], completed('too late')]);
+	const {provider} = providerWith({replies: [response(200, body)]});
+	await rejectsWithCode(() => provider.summarize(params), 'CODEX_RESPONSE_INCOMPLETE');
+}
+
+async function testDeltaAndCompletedTextAreNotDoubleAppended() {
+	const body = sse([delta('same output'), completed('same output'), ['data: [DONE]']]);
+	const {provider} = providerWith({replies: [response(200, body)]});
+	assert.equal(await provider.summarize(params), 'same output');
+}
+
+async function testCrOnlySseLineEndingsAreSupported() {
+	const body = sse([delta('cr only'), completed('cr only'), ['data: [DONE]']], '\r');
+	const {provider} = providerWith({replies: [response(200, body)]});
+	assert.equal(await provider.summarize(params), 'cr only');
+}
+
 async function testUnknownSseEventsAndMultilineDataAreIgnoredOrParsed() {
 	const body = [
 		': comment',
@@ -436,12 +546,20 @@ async function main() {
 	await run('second 401 stops without third request', testSecond401StopsWithoutThirdRequest);
 	await run('non-401 does not reload or retry', testNon401DoesNotReloadOrRetry);
 	await run('injected auth validation', testInjectedAuthValidation);
+	await run('unsafe access tokens are rejected before HTTP request', testUnsafeAccessTokensAreRejectedBeforeHttpRequest);
+	await run('maximum-length safe access token is accepted', testMaximumLengthSafeAccessTokenIsAccepted);
 	await run('auth JSON shape validation and unknown fields', testAuthJsonShapeValidationAndUnknownFields);
 	await run('default path and safe-open flags', testDefaultPathAndSafeOpenFlags);
 	await run('safe-open real file boundaries', testSafeOpenRealFileBoundaries);
 	await run('safe reader injected violations and close finally', testSafeReaderInjectedViolationsAndCloseFinally);
 	await run('HTTP and response property errors are safe', testHttpAndResponsePropertyErrorsAreSafe);
 	await run('SSE failure boundaries', testSseFailureBoundaries);
+	await run('duplicate completed is rejected', testDuplicateCompletedIsRejected);
+	await run('semantic events after completed are rejected', testSemanticEventsAfterCompletedAreRejected);
+	await run('DONE hard-terminates and ignores following bytes', testDoneHardTerminatesAndIgnoresAllFollowingBytes);
+	await run('DONE before completed remains incomplete', testDoneBeforeCompletedRemainsIncomplete);
+	await run('delta and completed text are not double-appended', testDeltaAndCompletedTextAreNotDoubleAppended);
+	await run('CR-only SSE line endings are supported', testCrOnlySseLineEndingsAreSupported);
 	await run('unknown SSE events and multiline data', testUnknownSseEventsAndMultilineDataAreIgnoredOrParsed);
 	await run('malformed SSE payload shapes are fixed parser errors', testMalformedDeltaAndCompletedPayloadAreFixedParserErrors);
 	console.log('codex_oauth_provider local tests passed');

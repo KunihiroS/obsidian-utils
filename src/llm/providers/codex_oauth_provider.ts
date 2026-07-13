@@ -11,6 +11,8 @@ import type {LlmProvider, SummarizeParams} from '../types';
 
 const CODEX_ENDPOINT = 'https://chatgpt.com/backend-api/codex/responses';
 const MAX_AUTH_FILE_SIZE = 1024 * 1024;
+const MAX_ACCESS_TOKEN_LENGTH = 16_384;
+const ACCESS_TOKEN_PATTERN = /^[A-Za-z0-9._~+/-]+=*$/;
 const ACCOUNT_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 
 type CodexAuth = {
@@ -77,7 +79,12 @@ function validateAuth(value: unknown): CodexAuth {
 	if (!isRecord(value)) throw fail('CODEX_AUTH_INVALID');
 	const accessToken = value.accessToken;
 	const accountId = value.accountId;
-	if (typeof accessToken !== 'string' || accessToken.length === 0) {
+	if (
+		typeof accessToken !== 'string'
+		|| accessToken.length === 0
+		|| accessToken.length > MAX_ACCESS_TOKEN_LENGTH
+		|| !ACCESS_TOKEN_PATTERN.test(accessToken)
+	) {
 		throw fail('CODEX_AUTH_ACCESS_TOKEN_INVALID');
 	}
 	if (
@@ -209,10 +216,13 @@ function parseSse(raw: string): string {
 	let output = '';
 	let sawDelta = false;
 	let sawCompleted = false;
+	let state: 'open' | 'completed' | 'done' = 'open';
 	let eventName: string | undefined;
 	let dataLines: string[] = [];
+	const isDone = (): boolean => state === 'done';
 
 	const processEvent = (): void => {
+		if (state === 'done') return;
 		if (dataLines.length === 0) {
 			eventName = undefined;
 			return;
@@ -220,7 +230,11 @@ function parseSse(raw: string): string {
 		const event = {eventName, data: dataLines.join('\n')};
 		eventName = undefined;
 		dataLines = [];
-		if (event.data === '[DONE]') return;
+		if (event.data === '[DONE]') {
+			state = 'done';
+			return;
+		}
+		if (state === 'completed') throw fail('CODEX_RESPONSE_SEQUENCE_INVALID');
 		const knownEventNames = new Set(['response.output_text.delta', 'response.completed', 'response.failed', 'error']);
 		if (event.eventName !== undefined && !knownEventNames.has(event.eventName)) return;
 		const payload = parseJsonData(event);
@@ -237,10 +251,12 @@ function parseSse(raw: string): string {
 			const finalText = completedOutputText(payload);
 			if (!sawDelta) output += finalText;
 			sawCompleted = true;
+			state = 'completed';
 		}
 	};
 
-	for (const line of raw.split(/\r?\n/)) {
+	for (const line of raw.split(/\r\n|\r|\n/)) {
+		if (isDone()) break;
 		if (line === '') {
 			processEvent();
 			continue;
