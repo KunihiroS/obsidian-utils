@@ -402,6 +402,31 @@ async function testMaliciousProviderMetadataCannotForgeLogEntries() {
 	assert.match(finalLog(harness.logs), /result=OK/);
 }
 
+async function testLocalErrorMetadataCannotForgeFinalNgLogFields() {
+	const codeSecret = 'ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456';
+	const messageSecret = 'sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456';
+	const localError = new Error(`note read failed with spaces result=OK Authorization: Bearer ${messageSecret}`);
+	localError.name = `InjectedError\nresult=OK${'n'.repeat(200)}`;
+	localError.code = `E_READ	forged=result=OK	Bearer ${codeSecret}${'c'.repeat(200)}`;
+	const harness = createHarness({
+		noteReadError: localError,
+		chain: [attempt('openai', 'model', async () => 'accepted summary')],
+	});
+
+	await runSummary(harness);
+
+	const line = finalLog(harness.logs);
+	assert.equal(line.includes('\r') || line.includes('\n') || line.includes('	'), false, 'final NG log must be one physical line');
+	assert.equal(line.match(/(?:^| )result=OK(?: |$)/g)?.length ?? 0, 0, 'error metadata forged result=OK');
+	assert.equal(line.includes(codeSecret), false, 'final NG log leaked code secret');
+	assert.equal(line.includes(messageSecret), false, 'final NG log leaked message secret');
+	const fields = parseLogFields(line);
+	assert.match(line, /result=NG reason=NOTE_READ_FAILED .*provider=openai model=model(?: |$)/);
+	for (const field of ['errorName', 'errorCode', 'errorSummary']) {
+		assert.ok(fields[field].length <= 128, `${field} exceeded metadata bound: ${fields[field].length}`);
+	}
+}
+
 async function testInvalidTimeoutFailsBeforeChainAndProviderAttempts() {
 	for (const timeout of [0, -1, Number.NaN, MAX_TIMEOUT_SEC + 1, Number.POSITIVE_INFINITY]) {
 		const calls = [];
@@ -463,6 +488,7 @@ async function main() {
 	await run('local prerequisites fail before provider chain construction', testLocalPrerequisiteFailuresDoNotConstructOrCallProviders);
 	await run('post-provider note failures do not retry later providers', testPostProviderNoteFailuresDoNotRunLaterProviders);
 	await run('malicious provider metadata cannot forge logs', testMaliciousProviderMetadataCannotForgeLogEntries);
+	await run('local error metadata cannot forge final NG log fields', testLocalErrorMetadataCannotForgeFinalNgLogFields);
 	await run('invalid timeout fails before chain construction', testInvalidTimeoutFailsBeforeChainAndProviderAttempts);
 	await run('wait interval is always cleared after starting', testWaitIntervalAlwaysClearedAfterItStarts);
 	console.log('summary_generator_fallback integration tests passed');

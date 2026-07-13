@@ -255,7 +255,7 @@ export async function generateSummary(
 			);
 		} else {
 			const errorPart = errorName.length > 0 || errorCode.length > 0 || errorSummary.length > 0
-				? ` errorName=${errorName} errorCode=${errorCode} errorSummary=${errorSummary}`
+				? ` errorName=${safeLogMetadataValue(errorName)} errorCode=${safeLogMetadataValue(errorCode)} errorSummary=${safeLogMetadataValue(errorSummary)}`
 				: '';
 			await dependencies.endLogBlock(
 				app,
