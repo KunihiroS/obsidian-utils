@@ -10,6 +10,7 @@ import type {LlmProvider, SummarizeParams} from '../types';
 
 const CODEX_ENDPOINT = 'https://chatgpt.com/backend-api/codex/responses';
 const MAX_AUTH_FILE_SIZE = 1024 * 1024;
+const MAX_AUTH_READ_CHUNK_SIZE = 64 * 1024;
 const MAX_ACCESS_TOKEN_LENGTH = 16_384;
 const ACCESS_TOKEN_PATTERN = /^[A-Za-z0-9._~+/-]+=*$/;
 const ACCOUNT_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
@@ -47,7 +48,12 @@ type SafeStat = {
 
 type SafeFileHandle = {
 	stat(): Promise<SafeStat>;
-	readFile(options: {encoding: 'utf8'}): Promise<string>;
+	read(
+		buffer: Buffer,
+		offset: number,
+		length: number,
+		position: number
+	): Promise<{bytesRead: number; buffer: Buffer}>;
 	close(): Promise<void>;
 };
 
@@ -170,10 +176,26 @@ async function readAuthFile(
 		if (!Number.isSafeInteger(stat.size) || stat.size < 0 || stat.size > MAX_AUTH_FILE_SIZE) {
 			throw fail('CODEX_AUTH_TOO_LARGE');
 		}
-		raw = await handle.readFile({encoding: 'utf8'});
-		if (Buffer.byteLength(raw, 'utf8') > MAX_AUTH_FILE_SIZE) {
-			throw fail('CODEX_AUTH_TOO_LARGE');
+		const buffer = Buffer.alloc(MAX_AUTH_FILE_SIZE + 1);
+		let totalBytesRead = 0;
+		while (totalBytesRead < buffer.length) {
+			const remaining = buffer.length - totalBytesRead;
+			const length = Math.min(remaining, MAX_AUTH_READ_CHUNK_SIZE);
+			const result = await handle.read(buffer, totalBytesRead, length, totalBytesRead);
+			const bytesRead = result?.bytesRead;
+			if (
+				typeof bytesRead !== 'number'
+				|| !Number.isInteger(bytesRead)
+				|| bytesRead < 0
+				|| bytesRead > length
+			) {
+				throw fail('CODEX_AUTH_READ_FAILED');
+			}
+			if (bytesRead === 0) break;
+			totalBytesRead += bytesRead;
 		}
+		if (totalBytesRead > MAX_AUTH_FILE_SIZE) throw fail('CODEX_AUTH_TOO_LARGE');
+		raw = buffer.toString('utf8', 0, totalBytesRead);
 	} catch (error) {
 		operationError = error;
 	} finally {
@@ -282,14 +304,13 @@ function parseSse(raw: string): string {
 		}
 	};
 
-	for (const line of raw.split(/\r\n|\r|\n/)) {
-		if (isDone()) break;
+	const processLine = (line: string): void => {
 		if (line === '') {
 			processEvent();
-			continue;
+			return;
 		}
 		eventBlockNonEmpty = true;
-		if (line.startsWith(':')) continue;
+		if (line.startsWith(':')) return;
 		const separator = line.indexOf(':');
 		const field = separator === -1 ? line : line.slice(0, separator);
 		let value = separator === -1 ? '' : line.slice(separator + 1);
@@ -303,8 +324,20 @@ function parseSse(raw: string): string {
 			dataLines.push(value);
 			eventDataLength += separatorLength + value.length;
 		}
+	};
+
+	let lineStart = 0;
+	while (lineStart < raw.length && !isDone()) {
+		let lineEnd = lineStart;
+		while (lineEnd < raw.length && raw[lineEnd] !== '\r' && raw[lineEnd] !== '\n') {
+			lineEnd += 1;
+		}
+		processLine(raw.slice(lineStart, lineEnd));
+		if (isDone() || lineEnd === raw.length) break;
+		lineStart = lineEnd + 1;
+		if (raw[lineEnd] === '\r' && raw[lineStart] === '\n') lineStart += 1;
 	}
-	processEvent();
+	if (!isDone() && eventBlockNonEmpty) processEvent();
 	if (!sawCompleted) throw fail('CODEX_RESPONSE_INCOMPLETE');
 	const summary = output.trim();
 	if (summary.length === 0) throw fail('CODEX_RESPONSE_EMPTY');

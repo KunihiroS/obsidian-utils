@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {Buffer} from 'node:buffer';
 import {constants as fsConstants} from 'node:fs';
 import {chmod, mkdtemp, rm, symlink, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
@@ -18,6 +19,8 @@ const {summarizeWithFallback} = jiti('../src/llm/fallback.ts');
 
 const ENDPOINT = 'https://chatgpt.com/backend-api/codex/responses';
 const RESOURCE_SENTINEL = 'raw-resource-limit-sentinel';
+const INCREMENTAL_SPLIT_SENTINEL = 'incremental-split-sentinel';
+const AUTH_READ_LIMIT = 1024 * 1024 + 1;
 const SECRET_VALUES = [
 	'fake.jwt.secret',
 	'fake-refresh-secret',
@@ -25,6 +28,7 @@ const SECRET_VALUES = [
 	'Bearer fake.jwt.secret',
 	'{"auth_mode":"chatgpt"}',
 	RESOURCE_SENTINEL,
+	INCREMENTAL_SPLIT_SENTINEL,
 ];
 const params = {systemPrompt: 'Summarize safely.', userContent: '<html>paper</html>'};
 
@@ -170,6 +174,42 @@ async function testRequestContractAndSseSuccess() {
 			include: [],
 		},
 	});
+}
+
+async function testSseParsingDoesNotSplitTheWholeRawResponse() {
+	const bodyText = `${(': keepalive\r\n\r\n').repeat(2_000)}: ${RESOURCE_SENTINEL}\r\n\r\n${sse([
+		delta('incremental summary'),
+		completed('incremental summary'),
+		['data: [DONE]'],
+	], '\r\n')}`;
+	const {provider} = providerWith({replies: [response(200, bodyText)]});
+	const originalSplit = String.prototype.split;
+	let summary;
+	let caught;
+
+	String.prototype.split = function(separator, limit) {
+		if (
+			String(this) === bodyText
+			&& separator instanceof RegExp
+			&& separator.source === '\\r\\n|\\r|\\n'
+		) {
+			throw new Error(INCREMENTAL_SPLIT_SENTINEL);
+		}
+		return originalSplit.call(this, separator, limit);
+	};
+	try {
+		summary = await provider.summarize(params);
+	} catch (error) {
+		caught = error;
+	} finally {
+		String.prototype.split = originalSplit;
+	}
+
+	if (caught !== undefined) {
+		assert.equal(containsSecret(caught), false, 'parser error leaked the split sentinel or raw SSE');
+		throw caught;
+	}
+	assert.equal(summary, 'incremental summary');
 }
 
 async function test401ReloadsSameAccountAndRetriesWithNewToken() {
@@ -426,6 +466,8 @@ async function testDefaultPathAndSafeOpenFlags() {
 	let openedPath;
 	let openedFlags;
 	let closed = 0;
+	const authBytes = Buffer.from(JSON.stringify({auth_mode: 'chatgpt', tokens: {access_token: 'token', account_id: 'account'}}));
+	let position = 0;
 	const provider = new CodexOAuthProvider('model', {
 		safeReaderDependencies: {
 			getUid: () => 123,
@@ -433,8 +475,13 @@ async function testDefaultPathAndSafeOpenFlags() {
 				openedPath = authPath;
 				openedFlags = flags;
 				return {
-					stat: async () => ({isFile: () => true, uid: 123, mode: 0o100600, size: 100}),
-					readFile: async () => JSON.stringify({auth_mode: 'chatgpt', tokens: {access_token: 'token', account_id: 'account'}}),
+					stat: async () => ({isFile: () => true, uid: 123, mode: 0o100600, size: authBytes.length}),
+					read: async (buffer, offset = 0, length = buffer.length - offset) => {
+						const bytesRead = Math.min(length, authBytes.length - position);
+						if (bytesRead > 0) authBytes.copy(buffer, offset, position, position + bytesRead);
+						position += bytesRead;
+						return {bytesRead, buffer};
+					},
 					close: async () => { closed++; },
 				};
 			},
@@ -451,6 +498,89 @@ async function testDefaultPathAndSafeOpenFlags() {
 		flags: fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
 		closed: 1,
 	});
+}
+
+async function testSafeAuthReaderUsesBoundedHandleReadsInsteadOfReadFile() {
+	const authBytes = Buffer.from(JSON.stringify({
+		auth_mode: 'chatgpt',
+		tokens: {access_token: 'token', account_id: 'account'},
+	}));
+	const requestedLengths = [];
+	let position = 0;
+	let readCalls = 0;
+	let readFileCalls = 0;
+	let closed = 0;
+	let httpRequests = 0;
+	const provider = new CodexOAuthProvider('model', {
+		safeReaderDependencies: {
+			getUid: () => 123,
+			open: async () => ({
+				stat: async () => ({isFile: () => true, uid: 123, mode: 0o100600, size: authBytes.length}),
+				read: async (buffer, offset = 0, length = buffer.length - offset) => {
+					readCalls++;
+					requestedLengths.push(length);
+					const bytesRead = Math.min(length, authBytes.length - position);
+					if (bytesRead > 0) authBytes.copy(buffer, offset, position, position + bytesRead);
+					position += bytesRead;
+					return {bytesRead, buffer};
+				},
+				readFile: async () => {
+					readFileCalls++;
+					throw new Error(INCREMENTAL_SPLIT_SENTINEL);
+				},
+				close: async () => { closed++; },
+			}),
+		},
+		httpClient: async () => {
+			httpRequests++;
+			return response(200, sse([delta('bounded auth'), completed()]));
+		},
+	});
+
+	assert.equal(await provider.summarize(params), 'bounded auth');
+	assert.equal(readCalls > 0, true);
+	assert.equal(readFileCalls, 0);
+	assert.equal(requestedLengths.every((length) => length <= AUTH_READ_LIMIT), true);
+	assert.equal(requestedLengths.reduce((total, length) => total + length, 0) <= AUTH_READ_LIMIT, true);
+	assert.deepEqual({httpRequests, closed}, {httpRequests: 1, closed: 1});
+}
+
+async function testSafeAuthReaderRejectsGrowthAfterStatWithinBoundedRead() {
+	const requestedLengths = [];
+	let bytesSupplied = 0;
+	let readFileCalls = 0;
+	let closed = 0;
+	let httpRequests = 0;
+	const provider = new CodexOAuthProvider('model', {
+		safeReaderDependencies: {
+			getUid: () => 123,
+			open: async () => ({
+				stat: async () => ({isFile: () => true, uid: 123, mode: 0o100600, size: 16}),
+				read: async (buffer, offset = 0, length = buffer.length - offset) => {
+					requestedLengths.push(length);
+					const bytesRead = Math.min(length, AUTH_READ_LIMIT - bytesSupplied);
+					if (bytesRead > 0) buffer.fill(0x20, offset, offset + bytesRead);
+					bytesSupplied += bytesRead;
+					return {bytesRead, buffer};
+				},
+				readFile: async () => {
+					readFileCalls++;
+					throw new Error(INCREMENTAL_SPLIT_SENTINEL);
+				},
+				close: async () => { closed++; },
+			}),
+		},
+		httpClient: async () => {
+			httpRequests++;
+			return response(200, 'unused');
+		},
+	});
+
+	await rejectsWithCode(() => provider.summarize(params), 'CODEX_AUTH_TOO_LARGE');
+	assert.equal(requestedLengths.every((length) => length <= AUTH_READ_LIMIT), true);
+	assert.equal(requestedLengths.reduce((total, length) => total + length, 0) <= AUTH_READ_LIMIT, true);
+	assert.equal(bytesSupplied <= AUTH_READ_LIMIT, true);
+	assert.deepEqual({readFileCalls, httpRequests, closed}, {readFileCalls: 0, httpRequests: 0, closed: 1});
 }
 
 async function testSafeOpenRealFileBoundaries() {
@@ -513,7 +643,7 @@ async function testSafeReaderInjectedViolationsAndCloseFinally() {
 		assert.equal(closed, testCase.code === 'CODEX_AUTH_UNSUPPORTED' ? 0 : 1);
 	}
 
-	for (const operation of ['stat', 'readFile']) {
+	for (const operation of ['stat', 'read']) {
 		let closed = 0;
 		const provider = new CodexOAuthProvider('model', {
 			safeReaderDependencies: {
@@ -523,9 +653,9 @@ async function testSafeReaderInjectedViolationsAndCloseFinally() {
 						if (operation === 'stat') throw new Error('fake.jwt.secret');
 						return {isFile: () => true, uid: 1, mode: 0o100600, size: 10};
 					},
-					readFile: async () => {
-						if (operation === 'readFile') throw new Error('fake-refresh-secret');
-						return '{}';
+					read: async () => {
+						if (operation === 'read') throw new Error('fake-refresh-secret');
+						return {bytesRead: 0};
 					},
 					close: async () => { closed++; },
 				}),
@@ -535,21 +665,6 @@ async function testSafeReaderInjectedViolationsAndCloseFinally() {
 		await rejectsWithCode(() => provider.summarize(params), 'CODEX_AUTH_READ_FAILED');
 		assert.equal(closed, 1);
 	}
-
-	let closedAfterOversizedRead = 0;
-	const changedAfterStatProvider = new CodexOAuthProvider('model', {
-		safeReaderDependencies: {
-			getUid: () => 1,
-			open: async () => ({
-				stat: async () => ({isFile: () => true, uid: 1, mode: 0o100600, size: 10}),
-				readFile: async () => 'x'.repeat(1024 * 1024 + 1),
-				close: async () => { closedAfterOversizedRead++; },
-			}),
-		},
-		httpClient: async () => response(200, ''),
-	});
-	await rejectsWithCode(() => changedAfterStatProvider.summarize(params), 'CODEX_AUTH_TOO_LARGE');
-	assert.equal(closedAfterOversizedRead, 1);
 }
 
 async function testHttpAndResponsePropertyErrorsAreSafe() {
@@ -754,6 +869,9 @@ async function run(name, test) {
 }
 
 async function main() {
+	await run('SSE parser scans incrementally without splitting the whole raw response', testSseParsingDoesNotSplitTheWholeRawResponse);
+	await run('safe auth reader uses bounded handle reads instead of readFile', testSafeAuthReaderUsesBoundedHandleReadsInsteadOfReadFile);
+	await run('safe auth reader rejects growth after fstat within the read bound', testSafeAuthReaderRejectsGrowthAfterStatWithinBoundedRead);
 	await run('Codex resource limits are exact positive integer exports', testCodexResourceLimitsAreExactPositiveIntegerExports);
 	await run('response text resource limit boundaries', testResponseTextResourceLimitBoundaries);
 	await run('SSE event data resource limit boundaries', testSseEventDataResourceLimitBoundaries);
