@@ -209,7 +209,15 @@ async function testAttemptsAreRuntimeImmutableSnapshots() {
 }
 
 async function testInvalidTimeoutIsRejectedBeforeAttemptsStart() {
-	for (const timeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+	for (const timeoutMs of [
+		0,
+		-1,
+		Number.NaN,
+		Number.POSITIVE_INFINITY,
+		Number.NEGATIVE_INFINITY,
+		2_147_483_648,
+		Number.MAX_SAFE_INTEGER,
+	]) {
 		const calls = [];
 		const events = [];
 		await assert.rejects(

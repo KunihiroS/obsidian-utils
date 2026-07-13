@@ -31,6 +31,8 @@ export type FallbackOptions = {
 
 class ProviderTimeoutError extends Error {}
 
+const MAX_TIMEOUT_MS = 2_147_483_647;
+
 export class FallbackAggregateError extends Error {
 	readonly attempts: readonly AttemptResult[];
 
@@ -97,8 +99,12 @@ export async function summarizeWithFallback(
 	params: SummarizeParams,
 	options: FallbackOptions
 ): Promise<FallbackResult> {
-	if (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) {
-		throw new RangeError('timeoutMs must be a positive finite number');
+	if (
+		!Number.isFinite(options.timeoutMs)
+		|| options.timeoutMs <= 0
+		|| options.timeoutMs > MAX_TIMEOUT_MS
+	) {
+		throw new RangeError(`timeoutMs must be between 1 and ${MAX_TIMEOUT_MS}`);
 	}
 
 	const results: AttemptResult[] = [];
