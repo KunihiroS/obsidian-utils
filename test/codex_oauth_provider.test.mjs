@@ -7,15 +7,23 @@ import process from 'node:process';
 import jitiFactory from 'jiti';
 
 const jiti = jitiFactory(import.meta.url);
-const {CodexOAuthProvider} = jiti('../src/llm/providers/codex_oauth_provider.ts');
+const {
+	CODEX_MAX_OUTPUT_CHARS,
+	CODEX_MAX_RESPONSE_CHARS,
+	CODEX_MAX_SSE_EVENT_CHARS,
+	CODEX_MAX_SSE_EVENTS,
+	CodexOAuthProvider,
+} = jiti('../src/llm/providers/codex_oauth_provider.ts');
 
 const ENDPOINT = 'https://chatgpt.com/backend-api/codex/responses';
+const RESOURCE_SENTINEL = 'raw-resource-limit-sentinel';
 const SECRET_VALUES = [
 	'fake.jwt.secret',
 	'fake-refresh-secret',
 	'account-secret',
 	'Bearer fake.jwt.secret',
 	'{"auth_mode":"chatgpt"}',
+	RESOURCE_SENTINEL,
 ];
 const params = {systemPrompt: 'Summarize safely.', userContent: '<html>paper</html>'};
 
@@ -87,6 +95,15 @@ async function rejectsWithCode(action, code) {
 		assert.equal(containsSecret(error), false, 'provider error leaked a secret');
 		return true;
 	});
+}
+
+async function doesNotRejectWithCode(action, code) {
+	try {
+		await action();
+	} catch (error) {
+		assert.notEqual(error instanceof Error ? error.message : error, code);
+		assert.equal(containsSecret(error), false, 'provider error leaked a secret');
+	}
 }
 
 async function withTempDir(test) {
@@ -534,12 +551,103 @@ async function testMalformedDeltaAndCompletedPayloadAreFixedParserErrors() {
 	}
 }
 
+async function testCodexResourceLimitsAreExactPositiveIntegerExports() {
+	const limits = {
+		CODEX_MAX_RESPONSE_CHARS,
+		CODEX_MAX_SSE_EVENT_CHARS,
+		CODEX_MAX_SSE_EVENTS,
+		CODEX_MAX_OUTPUT_CHARS,
+	};
+	assert.deepEqual(limits, {
+		CODEX_MAX_RESPONSE_CHARS: 4 * 1024 * 1024,
+		CODEX_MAX_SSE_EVENT_CHARS: 256 * 1024,
+		CODEX_MAX_SSE_EVENTS: 10_000,
+		CODEX_MAX_OUTPUT_CHARS: 512 * 1024,
+	});
+	assert.equal(Object.values(limits).every((limit) => Number.isInteger(limit) && limit > 0), true);
+}
+
+async function testResponseTextResourceLimitBoundaries() {
+	const oversizedBody = RESOURCE_SENTINEL + 'x'.repeat((4 * 1024 * 1024 + 1) - RESOURCE_SENTINEL.length);
+	const oversized = providerWith({replies: [response(200, oversizedBody)]});
+	await rejectsWithCode(() => oversized.provider.summarize(params), 'CODEX_RESPONSE_TOO_LARGE');
+
+	const exactBody = 'x'.repeat(4 * 1024 * 1024);
+	const exact = providerWith({replies: [response(200, exactBody)]});
+	await doesNotRejectWithCode(() => exact.provider.summarize(params), 'CODEX_RESPONSE_TOO_LARGE');
+}
+
+async function testSseEventDataResourceLimitBoundaries() {
+	const makeUnknownEvent = (dataLength) => [
+		'event: future.resource-limit',
+		`data: ${RESOURCE_SENTINEL}${'x'.repeat(dataLength - RESOURCE_SENTINEL.length)}`,
+	];
+	const oversizedBody = sse([makeUnknownEvent(256 * 1024 + 1), completed('ok')]);
+	const oversized = providerWith({replies: [response(200, oversizedBody)]});
+	await rejectsWithCode(() => oversized.provider.summarize(params), 'CODEX_SSE_EVENT_TOO_LARGE');
+
+	const exactBody = sse([makeUnknownEvent(256 * 1024), completed('ok')]);
+	const exact = providerWith({replies: [response(200, exactBody)]});
+	await doesNotRejectWithCode(() => exact.provider.summarize(params), 'CODEX_SSE_EVENT_TOO_LARGE');
+}
+
+async function testSseEventCountResourceLimitBoundaries() {
+	const unknownBlock = 'event: future.resource-limit\ndata: {}\n\n';
+	const oversizedBody = unknownBlock.repeat(10_000) + sse([completed('ok')]);
+	const oversized = providerWith({replies: [response(200, oversizedBody)]});
+	await rejectsWithCode(() => oversized.provider.summarize(params), 'CODEX_SSE_EVENT_LIMIT');
+
+	const exactBody = unknownBlock.repeat(9_999) + sse([completed('ok')]);
+	const exact = providerWith({replies: [response(200, exactBody)]});
+	await doesNotRejectWithCode(() => exact.provider.summarize(params), 'CODEX_SSE_EVENT_LIMIT');
+}
+
+async function testCumulativeOutputResourceLimitBoundaries() {
+	const maxOutput = 512 * 1024;
+	const chunk = 'x'.repeat(maxOutput / 4);
+	const afterExactOutput = providerWith({replies: [response(200, sse([
+		delta(chunk),
+		delta(chunk),
+		delta(chunk),
+		delta(chunk),
+		delta(RESOURCE_SENTINEL),
+		completed(),
+	]))]});
+	await rejectsWithCode(() => afterExactOutput.provider.summarize(params), 'CODEX_OUTPUT_TOO_LARGE');
+
+	const finalAddition = RESOURCE_SENTINEL + 'y'.repeat((maxOutput / 4 + 1) - RESOURCE_SENTINEL.length);
+	const crossingAddition = providerWith({replies: [response(200, sse([
+		delta(chunk),
+		delta(chunk),
+		delta(chunk),
+		delta(finalAddition),
+		completed(),
+	]))]});
+	await rejectsWithCode(() => crossingAddition.provider.summarize(params), 'CODEX_OUTPUT_TOO_LARGE');
+
+	const exactChunk = 'o'.repeat(maxOutput / 4);
+	const exactOutput = exactChunk.repeat(4);
+	const exact = providerWith({replies: [response(200, sse([
+		delta(exactChunk),
+		delta(exactChunk),
+		delta(exactChunk),
+		delta(exactChunk),
+		completed(RESOURCE_SENTINEL),
+	]))]});
+	assert.equal(await exact.provider.summarize(params), exactOutput);
+}
+
 async function run(name, test) {
 	await test();
 	console.log(`ok - ${name}`);
 }
 
 async function main() {
+	await run('Codex resource limits are exact positive integer exports', testCodexResourceLimitsAreExactPositiveIntegerExports);
+	await run('response text resource limit boundaries', testResponseTextResourceLimitBoundaries);
+	await run('SSE event data resource limit boundaries', testSseEventDataResourceLimitBoundaries);
+	await run('SSE event count resource limit boundaries', testSseEventCountResourceLimitBoundaries);
+	await run('cumulative output resource limit boundaries', testCumulativeOutputResourceLimitBoundaries);
 	await run('request contract and SSE success', testRequestContractAndSseSuccess);
 	await run('401 reloads same account and retries with new token', test401ReloadsSameAccountAndRetriesWithNewToken);
 	await run('401 account mismatch or missing does not retry', test401AccountMismatchOrMissingDoesNotRetry);

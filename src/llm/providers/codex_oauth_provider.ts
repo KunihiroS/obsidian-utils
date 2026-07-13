@@ -14,6 +14,11 @@ const MAX_ACCESS_TOKEN_LENGTH = 16_384;
 const ACCESS_TOKEN_PATTERN = /^[A-Za-z0-9._~+/-]+=*$/;
 const ACCOUNT_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 
+export const CODEX_MAX_RESPONSE_CHARS = 4 * 1024 * 1024;
+export const CODEX_MAX_SSE_EVENT_CHARS = 256 * 1024;
+export const CODEX_MAX_SSE_EVENTS = 10_000;
+export const CODEX_MAX_OUTPUT_CHARS = 512 * 1024;
+
 type CodexAuth = {
 	accessToken: string;
 	accountId: string;
@@ -195,40 +200,60 @@ function parseJsonData(event: ParsedSseEvent): Record<string, unknown> {
 	return parsed;
 }
 
-function completedOutputText(payload: Record<string, unknown>): string {
+function appendCompletedOutputText(
+	payload: Record<string, unknown>,
+	appendOutput: (addition: string) => void
+): void {
 	const response = payload.response;
 	if (!isRecord(response)) throw fail('CODEX_RESPONSE_INVALID');
-	if (!Array.isArray(response.output)) return '';
-	let text = '';
+	if (!Array.isArray(response.output)) return;
 	for (const output of response.output) {
 		if (!isRecord(output) || !Array.isArray(output.content)) continue;
 		for (const content of output.content) {
 			if (isRecord(content) && content.type === 'output_text' && typeof content.text === 'string') {
-				text += content.text;
+				appendOutput(content.text);
 			}
 		}
 	}
-	return text;
 }
 
 function parseSse(raw: string): string {
+	if (raw.length > CODEX_MAX_RESPONSE_CHARS) throw fail('CODEX_RESPONSE_TOO_LARGE');
 	let output = '';
+	let outputLength = 0;
 	let sawDelta = false;
 	let sawCompleted = false;
 	let state: 'open' | 'completed' | 'done' = 'open';
 	let eventName: string | undefined;
 	let dataLines: string[] = [];
+	let eventDataLength = 0;
+	let eventCount = 0;
+	let eventBlockNonEmpty = false;
 	const isDone = (): boolean => state === 'done';
+	const appendOutput = (addition: string): void => {
+		if (addition.length > CODEX_MAX_OUTPUT_CHARS - outputLength) {
+			throw fail('CODEX_OUTPUT_TOO_LARGE');
+		}
+		output += addition;
+		outputLength += addition.length;
+	};
 
 	const processEvent = (): void => {
 		if (state === 'done') return;
+		if (eventBlockNonEmpty) {
+			eventCount += 1;
+			if (eventCount > CODEX_MAX_SSE_EVENTS) throw fail('CODEX_SSE_EVENT_LIMIT');
+		}
+		eventBlockNonEmpty = false;
 		if (dataLines.length === 0) {
 			eventName = undefined;
+			eventDataLength = 0;
 			return;
 		}
 		const event = {eventName, data: dataLines.join('\n')};
 		eventName = undefined;
 		dataLines = [];
+		eventDataLength = 0;
 		if (event.data === '[DONE]') {
 			state = 'done';
 			return;
@@ -242,13 +267,12 @@ function parseSse(raw: string): string {
 		if (type === 'response.failed' || event.eventName === 'response.failed') throw fail('CODEX_RESPONSE_FAILED');
 		if (type === 'response.output_text.delta' || event.eventName === 'response.output_text.delta') {
 			if (typeof payload.delta !== 'string') throw fail('CODEX_RESPONSE_INVALID');
-			output += payload.delta;
+			appendOutput(payload.delta);
 			sawDelta = true;
 			return;
 		}
 		if (type === 'response.completed' || event.eventName === 'response.completed') {
-			const finalText = completedOutputText(payload);
-			if (!sawDelta) output += finalText;
+			if (!sawDelta) appendCompletedOutputText(payload, appendOutput);
 			sawCompleted = true;
 			state = 'completed';
 		}
@@ -260,13 +284,21 @@ function parseSse(raw: string): string {
 			processEvent();
 			continue;
 		}
+		eventBlockNonEmpty = true;
 		if (line.startsWith(':')) continue;
 		const separator = line.indexOf(':');
 		const field = separator === -1 ? line : line.slice(0, separator);
 		let value = separator === -1 ? '' : line.slice(separator + 1);
 		if (value.startsWith(' ')) value = value.slice(1);
 		if (field === 'event') eventName = value;
-		if (field === 'data') dataLines.push(value);
+		if (field === 'data') {
+			const separatorLength = dataLines.length === 0 ? 0 : 1;
+			if (value.length + separatorLength > CODEX_MAX_SSE_EVENT_CHARS - eventDataLength) {
+				throw fail('CODEX_SSE_EVENT_TOO_LARGE');
+			}
+			dataLines.push(value);
+			eventDataLength += separatorLength + value.length;
+		}
 	}
 	processEvent();
 	if (!sawCompleted) throw fail('CODEX_RESPONSE_INCOMPLETE');
