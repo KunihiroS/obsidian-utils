@@ -75,6 +75,8 @@ The plugin never refreshes credentials, writes the auth file, or runs the Codex 
 
 Before reading credentials, the plugin verifies POSIX ownership and permissions, rejects symbolic links, and enforces an auth-file size limit. Codex OAuth is therefore unavailable on mobile and unsupported non-POSIX environments.
 
+Codex responses are bounded before SSE parsing to 4 Mi characters. The parser also limits one event's data to 256 Ki characters, one response to 10,000 events, and cumulative summary output to 512 Ki characters. These limits bound parser work and accepted output; they are not a streaming transport bound because Obsidian's request API buffers the response first.
+
 ## Template format
 
 Your template file is a regular Markdown file stored inside the Vault. The plugin replaces these placeholders:
@@ -182,7 +184,7 @@ pnpm run build
 pnpm run lint
 ```
 
-`eslint-suppressions.json` is a temporary, count-based baseline for pre-existing lint errors discovered during KUN-1036. New violations and increases beyond the recorded counts still fail lint. KUN-1040 owns removing the baseline; do not expand it for feature work.
+`eslint-suppressions.json` is a temporary, count-based baseline for pre-existing lint errors discovered during KUN-1036. It fails when a file/rule count rises above the baseline, but it cannot detect a same-count replacement within that file/rule. KUN-1040 owns removing the baseline; feature work must not regenerate or expand it and should lint changed files directly.
 
 ### Manual install (local)
 
