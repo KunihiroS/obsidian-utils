@@ -7,7 +7,7 @@
 ## 承認済み方針
 
 - Codex経路はCLI subprocessではなく、既存の `~/.codex/auth.json` をread-onlyで利用するbackend direct adapterとする。
-- Codex authは各要約要求で読み直す。401時のみ一度再読込・再試行し、なお失敗する場合はGeminiへ進む。
+- Codex authは各要約要求で読み直す。401時のみ一度再読込し、初回と再読込後のaccount IDが完全一致する場合だけ再試行する。不一致・欠落・二度目の401はCodex失敗としてGeminiへ進む。
 - refresh tokenは使用せず、Codex所有のauth stateを更新しない。独自refreshはtoken rotationとCodex CLIとの競合を起こし得るため採用しない。
 - `CODEX_MODEL` は任意設定とし、未設定時はcontrolled probeで成功した `gpt-5.4-mini` を使う。
 - Providerで発生した例外は種類を問わず次経路へ進む。HTML、prompt、note read/writeなどのローカル失敗はフォールバック対象外とする。
@@ -17,7 +17,7 @@
 ### Provider adapter
 
 - `OpenAiChatProvider`: 既存OpenAI Chat Completions経路。
-- `CodexOAuthProvider`: Codex auth JSONの安全な読取、JWT payloadからのaccount ID解決、Responses SSE要求、401時一回再読込を担当する。
+- `CodexOAuthProvider`: Codex auth JSONの安全なread-only読取、Responses SSE要求、401時のaccount一致付き一回再読込を担当する。
 - `GeminiProvider`: 既存Gemini generateContent経路。
 
 各adapterは `LlmProvider.summarize()` で完成文字列を返し、Vaultへ書き込まない。
@@ -44,6 +44,20 @@
 
 このrouteは公開安定APIとは扱わず、adapterへ隔離する。endpoint/header/model/auth driftはCodex Provider failureとしてGeminiへ進む。
 
+### Auth file安全境界
+
+- 対応modeは現在実証済みのtop-level `auth_mode="chatgpt"`、`tokens.access_token`、`tokens.account_id`に限定する。`tokens.account_id`を第一契約とし、未知mode、keyring-only、Agent Identity、未知shapeは安全なProvider failureにする。未知fieldは無視する。
+- Linuxでは`O_RDONLY | O_NOFOLLOW`でopenし、同じfile descriptorを`fstat`してregular file、現在user所有、group/world permissionなし、上限1 MiB以下を確認してから同じdescriptorで読む。symlink、directory、owner不一致、緩いpermission、巨大/partial JSONは固定エラーコードで失敗する。
+- JWT claimをaccount IDの推測fallbackとして利用しない。token/account/auth JSONの値はadapter外へ返さない。
+- Codex adapterはraw filesystem/HTTP/parser error、response body、headersを上位へ返さず、`CODEX_AUTH_*`、`CODEX_HTTP_*`、`CODEX_RESPONSE_*`の固定コードへ変換する。logger redactionは二次防御とする。
+
+### Transport・timeout境界
+
+- Obsidian `requestUrl`は`throw:false`で使用し、HTTP statusをadapterで判定する。SSEはstreaming表示せず、buffered responseとして解析する。
+- `requestUrl`にはAbortSignalがなく、timeout後も通信自体はcancelできない。chainはlate resultを隔離してnote writeへ接続しないが、次Provider要求と一時的に重なる可能性を互換性制約として受容する。
+- 真のtransport cancellationやdesktop helper/subprocessは本Issueで追加しない。
+- Node filesystem/home依存は既存実装にも存在するため、runtime実態に合わせ`manifest.json`をdesktop-onlyへ修正する。
+
 ## エラーとログ
 
 ログにはprovider、model、attempt順、結果、正規化reason、最終成功経路を記録する。token、API key、Authorization値、account ID、auth JSON内容は記録しない。
@@ -59,6 +73,9 @@
 - config/auth/HTTP/timeout/invalid/emptyを含むProvider失敗
 - local-stage failureでchainを起動しない境界
 - Codex SSE parse、401一回再読込、auth file read-only
+- 401再読込時のaccount一致、不一致時no-retry
+- auth fileのsymlink/owner/permission/size/schema境界
+- buffered/non-cancellable timeout後もlate resultがsingle writeへ入らないこと
 - fake secretを含むerrorのredaction
 - `pnpm run test`、`pnpm run lint`、`pnpm run build`
 

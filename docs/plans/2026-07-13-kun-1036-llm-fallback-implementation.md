@@ -57,15 +57,19 @@
 - Test: `test/codex_oauth_provider.test.mjs`
 - Modify: `package.json:7-12`
 
-**Step 1:** dependency injectionしたfake auth reader/HTTP clientで、auth missing・token missing・account ID missingをテストする。
+**Step 1:** dependency injectionしたfake auth reader/HTTP clientで、auth missing・token missing・account ID missing・unknown auth mode/shapeをテストする。
 
-**Step 2:** JWT account claim解決、request body/header名、SSE delta結合とcompleted判定をテストする。secret値そのものはassert failure outputへ含めない。
+**Step 2:** `tokens.account_id`優先、request body/header名、`throw:false`、SSE delta結合とcompleted判定をテストする。secret値そのものはassert failure outputへ含めない。
 
-**Step 3:** 初回401でauthを再読込し一度だけ再試行、二度目の401で失敗するテストを書く。
+**Step 3:** 初回401でauthを再読込し、account ID一致時だけ一度再試行するテストを書く。不一致/欠落時は再送せず、二度目の401では失敗する。
 
-**Step 4:** providerがauth readerへreadだけを要求し、write APIを持たないことをテスト構造で固定する。
+**Step 4:** providerがauth readerへreadだけを要求し、write APIを持たないことをテスト構造で固定する。raw auth/HTTP/parser errorは固定コードへ変換し、JWT、refresh token、account ID、auth JSON断片をevent/errorへ渡さないことを確認する。
 
-**Step 5:** 最小実装を追加し、対象テストをPASSさせる。
+**Step 5:** Linux safe-open境界（`O_NOFOLLOW`、regular file、owner、permission、1 MiB上限、partial JSON）をfake file handleでテストする。
+
+**Step 6:** malformed/failed/completedなし/空出力を含むSSE失敗境界をテストする。
+
+**Step 7:** 最小実装を追加し、対象テストをPASSさせる。
 
 ### Task 4: Summary generatorへchainを統合する
 
@@ -74,17 +78,23 @@
 **Files:**
 - Modify: `src/summary_generator.ts:131-197,230-242`
 - Modify: `src/logger.ts:10-56`（必要なredaction export/testabilityのみ）
+- Modify: `manifest.json`（Node filesystemを使うruntime実態に合わせdesktop-only化）
 - Test: `test/llm_fallback.test.mjs`
+- Create: `test/summary_generator.test.mjs`
 
 **Step 1:** attempt callbackの開始/失敗/成功イベントとnormalized reasonをテストする。
 
 **Step 2:** summary generatorがchain結果のprovider/modelを最終ログへ記録するよう変更する。
 
-**Step 3:** 全経路失敗時はnote writeへ到達せず、ユーザー通知と安全な集約reasonを残す。
+**Step 3:** `generateSummary()`統合テストで、Codex/Gemini成功のsingle write、timeout後late Primaryの隔離、既存summary block置換、全経路失敗時の本文byte-identicalを確認する。
 
-**Step 4:** fake secretを含むProvider errorがattempt/end logでredactされるテストを追加する。
+**Step 4:** HTML missing/read error、prompt missing/invalid/read errorでchain未起動、note moved/read/write failureで後続Providerへ戻らないlocal-stage exclusionテストを追加する。
 
-**Step 5:** テストを実行してPASSを確認する。
+**Step 5:** allowlist外のError/TypeError/non-Error throwを含む全Provider-stage failureが次attemptへ進むtable testを追加する。
+
+**Step 6:** fake JWT、refresh token、account ID、auth JSON、Authorizationを含むProvider errorがattempt/end logの全sinkへ入らないテストを追加する。
+
+**Step 7:** テストを実行してPASSを確認する。
 
 ### Task 5: 設定・READMEを実効動作へ合わせる
 
