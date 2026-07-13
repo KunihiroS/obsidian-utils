@@ -18,6 +18,40 @@ function attempt(providerName, model, summarize) {
 	};
 }
 
+function delayWith(setTimeoutFn, milliseconds) {
+	return new Promise((resolve) => setTimeoutFn(resolve, milliseconds));
+}
+
+async function withTrackedTimeouts(run) {
+	const originalSetTimeout = globalThis.setTimeout;
+	const originalClearTimeout = globalThis.clearTimeout;
+	const activeHandles = new Set();
+	let clearCount = 0;
+
+	globalThis.setTimeout = (callback, delay, ...args) => {
+		let handle;
+		handle = originalSetTimeout((...callbackArgs) => {
+			activeHandles.delete(handle);
+			callback(...callbackArgs);
+		}, delay, ...args);
+		activeHandles.add(handle);
+		return handle;
+	};
+	globalThis.clearTimeout = (handle) => {
+		clearCount += 1;
+		activeHandles.delete(handle);
+		return originalClearTimeout(handle);
+	};
+
+	try {
+		await run({activeHandles, getClearCount: () => clearCount});
+	} finally {
+		globalThis.setTimeout = originalSetTimeout;
+		globalThis.clearTimeout = originalClearTimeout;
+		for (const handle of activeHandles) originalClearTimeout(handle);
+	}
+}
+
 async function testPrimarySuccessShortCircuits() {
 	const calls = [];
 	const result = await summarizeWithFallback([
@@ -172,6 +206,72 @@ async function testAttemptCallbackExceptionsDoNotAffectProviderChain() {
 					observedEventTypes: ['start', 'success'],
 				}
 		);
+	}
+}
+
+async function testNeverSettlingAttemptObserverDoesNotBlockPrimarySuccess() {
+	const originalSetTimeout = globalThis.setTimeout;
+	const calls = [];
+	const events = [];
+	let watchdog;
+
+	try {
+		const result = await Promise.race([
+			summarizeWithFallback([
+				attempt('openai', 'openai-model', async () => {
+					calls.push('openai');
+					return 'primary summary';
+				}),
+			], params, {
+				timeoutMs: 100,
+				onAttempt: (event) => {
+					events.push(event);
+					return new Promise(() => {});
+				},
+			}),
+			new Promise((_, reject) => {
+				watchdog = originalSetTimeout(() => reject(new Error('observer watchdog won')), 250);
+			}),
+		]);
+
+		assert.deepEqual(
+			{summary: result.summary, providerName: result.providerName, calls, events},
+			{
+				summary: 'primary summary',
+				providerName: 'openai',
+				calls: ['openai'],
+				events: [
+					{type: 'start', attempt: 1, providerName: 'openai', model: 'openai-model'},
+					{type: 'success', attempt: 1, providerName: 'openai', model: 'openai-model'},
+				],
+			}
+		);
+	} finally {
+		if (watchdog !== undefined) globalThis.clearTimeout(watchdog);
+	}
+}
+
+async function testRejectedAttemptObserverIsConsumed() {
+	const originalSetTimeout = globalThis.setTimeout;
+	const unhandledRejections = [];
+	const onUnhandledRejection = (reason) => unhandledRejections.push(reason);
+	process.on('unhandledRejection', onUnhandledRejection);
+
+	try {
+		const result = await summarizeWithFallback([
+			attempt('openai', 'openai-model', async () => 'primary summary'),
+		], params, {
+			timeoutMs: 100,
+			onAttempt: () => Promise.reject(new Error('observer failed')),
+		});
+		await delayWith(originalSetTimeout, 20);
+
+		assert.deepEqual(
+			{summary: result.summary, providerName: result.providerName, unhandledRejections},
+			{summary: 'primary summary', providerName: 'openai', unhandledRejections: []}
+		);
+	} finally {
+		process.removeListener('unhandledRejection', onUnhandledRejection);
 	}
 }
 
@@ -345,6 +445,56 @@ async function testLateCompletionCannotBecomeSuccessOrEmitSideEffects() {
 	);
 }
 
+async function testLatePrimaryRejectionIsConsumedAfterFallbackSuccess() {
+	const originalSetTimeout = globalThis.setTimeout;
+	let rejectPrimary;
+	const primary = new Promise((_, reject) => {
+		rejectPrimary = reject;
+	});
+	const unhandledRejections = [];
+	const onUnhandledRejection = (reason) => unhandledRejections.push(reason);
+	process.on('unhandledRejection', onUnhandledRejection);
+
+	try {
+		const result = await summarizeWithFallback([
+			attempt('openai', 'openai-model', () => primary),
+			attempt('codex', 'codex-model', async () => 'fallback summary'),
+		], params, {timeoutMs: 10});
+
+		rejectPrimary(new Error('late primary rejection'));
+		await delayWith(originalSetTimeout, 20);
+
+		assert.deepEqual(
+			{summary: result.summary, providerName: result.providerName, unhandledRejections},
+			{summary: 'fallback summary', providerName: 'codex', unhandledRejections: []}
+		);
+	} finally {
+		process.removeListener('unhandledRejection', onUnhandledRejection);
+	}
+}
+
+async function testProviderTimeoutHandlesAreClearedWhenAttemptsSettle() {
+	await withTrackedTimeouts(async ({activeHandles, getClearCount}) => {
+		const success = await summarizeWithFallback([
+			attempt('openai', 'openai-model', async () => 'primary summary'),
+		], params, {timeoutMs: 100});
+		assert.equal(success.summary, 'primary summary');
+		assert.equal(activeHandles.size, 0);
+
+		const fallback = await summarizeWithFallback([
+			attempt('openai', 'openai-model', async () => {
+				throw new Error('primary failed');
+			}),
+			attempt('codex', 'codex-model', async () => 'fallback summary'),
+		], params, {timeoutMs: 100});
+		assert.equal(fallback.summary, 'fallback summary');
+		assert.deepEqual(
+			{activeHandleCount: activeHandles.size, clearCount: getClearCount()},
+			{activeHandleCount: 0, clearCount: 3}
+		);
+	});
+}
+
 async function run(name, test) {
 	await test();
 	console.log(`ok - ${name}`);
@@ -355,12 +505,16 @@ async function main() {
 	await run('primary failure falls back to Codex', testPrimaryFailureFallsBackToCodex);
 	await run('first two failures fall back to Gemini', testFirstTwoFailuresFallBackToGemini);
 	await run('attempt callback exceptions do not affect provider chain', testAttemptCallbackExceptionsDoNotAffectProviderChain);
+	await run('never-settling attempt observer does not block primary success', testNeverSettlingAttemptObserverDoesNotBlockPrimarySuccess);
+	await run('rejected attempt observer is consumed', testRejectedAttemptObserverIsConsumed);
 	await run('attempt histories are runtime immutable snapshots', testAttemptsAreRuntimeImmutableSnapshots);
 	await run('invalid timeout is rejected before attempts start', testInvalidTimeoutIsRejectedBeforeAttemptsStart);
 	await run('non-Error throw falls back to next provider', testNonErrorThrowFallsBackToNextProvider);
 	await run('all failures are safe and aggregated', testAllFailuresAreAggregatedWithoutRawErrors);
 	await run('timeout falls back to next provider', testTimeoutFallsBackToNextProvider);
 	await run('late completion is isolated', testLateCompletionCannotBecomeSuccessOrEmitSideEffects);
+	await run('late primary rejection is consumed', testLatePrimaryRejectionIsConsumedAfterFallbackSuccess);
+	await run('provider timeout handles are cleared when attempts settle', testProviderTimeoutHandlesAreClearedWhenAttemptsSettle);
 	console.log('llm_fallback local tests passed');
 }
 

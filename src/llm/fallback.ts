@@ -47,12 +47,12 @@ function immutableAttempts(attempts: readonly AttemptResult[]): readonly Attempt
 	return Object.freeze(attempts.map((attempt) => Object.freeze({...attempt})));
 }
 
-async function emitAttempt(
+function emitAttempt(
 	onAttempt: FallbackOptions['onAttempt'],
 	event: AttemptEvent
-): Promise<void> {
+): void {
 	try {
-		await onAttempt?.(event);
+		Promise.resolve(onAttempt?.(event)).catch(() => {});
 	} catch {
 		// Observability failures must not alter provider-chain behavior.
 	}
@@ -113,7 +113,7 @@ export async function summarizeWithFallback(
 		const current = attempts[index];
 		if (current === undefined) continue;
 		const base = eventBase(current, index + 1);
-		await emitAttempt(options.onAttempt, {type: 'start', ...base});
+		emitAttempt(options.onAttempt, {type: 'start', ...base});
 
 		try {
 			const summary = await runWithTimeout(
@@ -122,7 +122,7 @@ export async function summarizeWithFallback(
 			);
 			const success: AttemptResult = {...base, outcome: 'success'};
 			results.push(success);
-			await emitAttempt(options.onAttempt, {type: 'success', ...base});
+			emitAttempt(options.onAttempt, {type: 'success', ...base});
 			return {
 				summary,
 				providerName: current.providerName,
@@ -134,7 +134,7 @@ export async function summarizeWithFallback(
 				? 'TIMEOUT'
 				: 'PROVIDER_ERROR';
 			results.push({...base, outcome: 'failure', reason});
-			await emitAttempt(options.onAttempt, {type: 'failure', ...base, reason});
+			emitAttempt(options.onAttempt, {type: 'failure', ...base, reason});
 		}
 	}
 
