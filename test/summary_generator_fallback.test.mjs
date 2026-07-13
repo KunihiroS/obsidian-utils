@@ -179,6 +179,32 @@ function assertSingleLineBoundedLogs(logs) {
 	}
 }
 
+async function testDisabledSummarySkipsAllSummaryWorkAsSuccessfulRun() {
+	const providerCalls = [];
+	const harness = createHarness({
+		settings: {summaryEnabled: false},
+		chain: [attempt('openai', 'must-not-run', async () => {
+			providerCalls.push('summarize:openai');
+			return 'must not be written';
+		})],
+	});
+
+	await runSummary(harness);
+
+	assert.deepEqual(harness.calls, []);
+	assert.equal(harness.providerChainCalls, 0);
+	assert.deepEqual(providerCalls, []);
+	assert.deepEqual(harness.startedIntervals, []);
+	assert.deepEqual(harness.clearedIntervals, []);
+	assert.deepEqual(harness.modifications, []);
+	assert.deepEqual(harness.notices, [
+		{message: 'Summary is disabled (Settings).', duration: undefined},
+	]);
+	assert.equal(harness.logs.length, 2);
+	assert.match(harness.logs[0], /component=summary_generator .*id=2501\.12345(?: |$)/);
+	assert.match(finalLog(harness.logs), /result=OK reason=SUMMARY_DISABLED_SKIP(?: |$)/);
+}
+
 async function testOpenAiFailureFallsBackToCodexAndLogsSelectedProvider() {
 	const calls = [];
 	const harness = createHarness({chain: [
@@ -480,6 +506,7 @@ async function run(name, test) {
 }
 
 async function main() {
+	await run('disabled summary skips all summary work as a successful run', testDisabledSummarySkipsAllSummaryWorkAsSuccessfulRun);
 	await run('OpenAI failure falls back to Codex and logs selected provider', testOpenAiFailureFallsBackToCodexAndLogsSelectedProvider);
 	await run('OpenAI and Codex failures fall back to Gemini with one write', testTwoFailuresFallBackToGeminiAndWriteOnce);
 	await run('late primary completion is isolated after timeout fallback', testPrimaryTimeoutLateResolveCannotWriteOrLogAgain);

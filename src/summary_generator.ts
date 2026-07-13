@@ -93,6 +93,13 @@ export async function generateSummary(
 	let errorSummary = '';
 
 	try {
+		if (settings.summaryEnabled === false) {
+			reason = 'SUMMARY_DISABLED_SKIP';
+			result = 'OK';
+			dependencies.notice('Summary is disabled (Settings).');
+			return;
+		}
+
 		dependencies.notice('(1/4) Reading HTML.');
 		const parentPath = noteFile.parent?.path ?? '';
 		const folderPath = normalizePath(parentPath ? `${parentPath}/${noteFile.basename}` : noteFile.basename);
