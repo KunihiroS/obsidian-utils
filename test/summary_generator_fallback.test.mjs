@@ -526,6 +526,34 @@ async function testSamePathReplacementIsNotReadOrModifiedAfterProviderSuccess() 
 	assert.match(finalLog(harness.logs), /result=NG reason=NOTE_MOVED_OR_DELETED(?: |$)/);
 }
 
+async function testMovedOriginalObjectIsNotReadOrModifiedAfterProviderSuccess() {
+	const providerCalls = [];
+	let harness;
+	harness = createHarness({
+		chain: [
+			attempt('openai', 'winner', async () => {
+				providerCalls.push('summarize:openai');
+				harness.noteFile.path = 'Archive/Test Paper.md';
+				return 'accepted summary';
+			}),
+			attempt('codex', 'must-not-run', async () => {
+				providerCalls.push('summarize:codex');
+				return 'incorrect retry';
+			}),
+		],
+		dependencies: {isTFile: (file) => file === harness.noteFile},
+	});
+
+	await runSummary(harness);
+
+	assert.deepEqual(providerCalls, ['summarize:openai']);
+	assert.ok(harness.calls.includes('vault.lookup:Papers/Test Paper.md'));
+	assert.equal(harness.calls.some((call) => call.startsWith('vault.read:')), false);
+	assert.equal(harness.calls.some((call) => call.startsWith('vault.modify:')), false);
+	assert.deepEqual(harness.modifications, []);
+	assert.match(finalLog(harness.logs), /result=NG reason=NOTE_MOVED_OR_DELETED(?: |$)/);
+}
+
 async function testInvalidTimeoutFailsBeforeChainAndProviderAttempts() {
 	for (const timeout of [0, -1, Number.NaN, MAX_TIMEOUT_SEC + 1, Number.POSITIVE_INFINITY]) {
 		const calls = [];
@@ -591,6 +619,7 @@ async function main() {
 	await run('local error metadata cannot forge final NG log fields', testLocalErrorMetadataCannotForgeFinalNgLogFields);
 	await run('malicious summary paths cannot forge start or final log fields', testMaliciousSummaryPathsCannotForgeStartOrFinalLogFields);
 	await run('same-path replacement is not read or modified after provider success', testSamePathReplacementIsNotReadOrModifiedAfterProviderSuccess);
+	await run('moved original object is not read or modified after provider success', testMovedOriginalObjectIsNotReadOrModifiedAfterProviderSuccess);
 	await run('invalid timeout fails before chain construction', testInvalidTimeoutFailsBeforeChainAndProviderAttempts);
 	await run('wait interval is always cleared after starting', testWaitIntervalAlwaysClearedAfterItStarts);
 	console.log('summary_generator_fallback integration tests passed');

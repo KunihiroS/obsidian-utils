@@ -1,5 +1,7 @@
 import {App, normalizePath} from 'obsidian';
 
+const logWriteQueues = new WeakMap<App, Map<string, Promise<void>>>();
+
 function pad2(n: number): string {
 	return String(n).padStart(2, '0');
 }
@@ -105,11 +107,42 @@ async function appendTextFile(app: App, filePath: string, contentToAppend: strin
 	await adapter.write(filePath, `${current}${contentToAppend}`);
 }
 
+function queueLogAppend(
+	app: App,
+	logDir: string,
+	logPath: string,
+	contentToAppend: string
+): Promise<void> {
+	let queuesByPath = logWriteQueues.get(app);
+	if (queuesByPath === undefined) {
+		queuesByPath = new Map<string, Promise<void>>();
+		logWriteQueues.set(app, queuesByPath);
+	}
+
+	const previous = queuesByPath.get(logPath) ?? Promise.resolve();
+	const current = previous
+		.catch(() => undefined)
+		.then(async () => {
+			await ensureFolderExists(app, logDir);
+			await appendTextFile(app, logPath, contentToAppend);
+		});
+	queuesByPath.set(logPath, current);
+
+	const cleanup = (): void => {
+		if (queuesByPath.get(logPath) !== current) return;
+		queuesByPath.delete(logPath);
+		if (queuesByPath.size === 0 && logWriteQueues.get(app) === queuesByPath) {
+			logWriteQueues.delete(app);
+		}
+	};
+	void current.then(cleanup, cleanup);
+	return current;
+}
+
 export async function appendLogLine(app: App, logDir: string, message: string): Promise<void> {
-	await ensureFolderExists(app, logDir);
 	const logPath = getDailyLogFilePath(logDir);
 	const redactedMessage = safeRedact(message, 'redact=FAILED message="Log redaction failed; original content suppressed."');
-	await appendTextFile(app, logPath, `${formatLogLine(redactedMessage)}\n`);
+	await queueLogAppend(app, logDir, logPath, `${formatLogLine(redactedMessage)}\n`);
 }
 
 export type LogBlock = {
@@ -119,18 +152,17 @@ export type LogBlock = {
 };
 
 export async function startLogBlock(app: App, logDir: string, startMessage: string): Promise<LogBlock> {
-	await ensureFolderExists(app, logDir);
 	const now = new Date();
 	const logPath = getDailyLogFilePath(logDir, now);
 	const runId = `${now.toISOString()}_${Math.random().toString(16).slice(2)}`;
 	const fallback = `block=START runId=${runId} redact=FAILED message="Log redaction failed; original content suppressed."`;
 	const redactedMessage = safeRedact(`block=START runId=${runId} ${startMessage}`, fallback);
-	await appendTextFile(app, logPath, `${formatLogLine(redactedMessage, now)}\n`);
+	await queueLogAppend(app, logDir, logPath, `${formatLogLine(redactedMessage, now)}\n`);
 	return {logDir, logPath, runId};
 }
 
 export async function endLogBlock(app: App, block: LogBlock, endMessage: string): Promise<void> {
 	const fallback = `block=END runId=${block.runId} redact=FAILED message="Log redaction failed; original content suppressed."`;
 	const redactedMessage = safeRedact(`block=END runId=${block.runId} ${endMessage}`, fallback);
-	await appendTextFile(app, block.logPath, `${formatLogLine(redactedMessage)}\n`);
+	await queueLogAppend(app, block.logDir, block.logPath, `${formatLogLine(redactedMessage)}\n`);
 }

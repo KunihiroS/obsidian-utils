@@ -66,6 +66,9 @@ export async function generateSummary(
 	inputUrl: string,
 	injectedDependencies: SummaryGeneratorDependencies = {}
 ): Promise<void> {
+	const originalNotePath = noteFile.path;
+	const originalNoteBaseName = noteFile.basename;
+	const originalParentPath = noteFile.parent?.path ?? '';
 	const dependencies = {...defaultDependencies, ...injectedDependencies};
 	const id = extractArxivIdFromUrl(inputUrl);
 
@@ -78,7 +81,7 @@ export async function generateSummary(
 	const logBlock: LogBlock = await dependencies.startLogBlock(
 		app,
 		logDir,
-		`component=summary_generator notePath=${safeLogMetadataValue(noteFile.path)} noteBaseName=${safeLogMetadataValue(noteFile.basename)} id=${id}`
+		`component=summary_generator notePath=${safeLogMetadataValue(originalNotePath)} noteBaseName=${safeLogMetadataValue(originalNoteBaseName)} id=${id}`
 	);
 
 	let reason = '';
@@ -101,8 +104,9 @@ export async function generateSummary(
 		}
 
 		dependencies.notice('(1/4) Reading HTML.');
-		const parentPath = noteFile.parent?.path ?? '';
-		const folderPath = normalizePath(parentPath ? `${parentPath}/${noteFile.basename}` : noteFile.basename);
+		const folderPath = normalizePath(originalParentPath
+			? `${originalParentPath}/${originalNoteBaseName}`
+			: originalNoteBaseName);
 		htmlPath = normalizePath(`${folderPath}/${id}.html`);
 
 		const adapter = app.vault.adapter;
@@ -208,8 +212,8 @@ export async function generateSummary(
 		summaryChars = fallbackResult.summary.length;
 
 		dependencies.notice('(4/4) Writing note.');
-		const latestFile = app.vault.getAbstractFileByPath(noteFile.path);
-		if (latestFile !== noteFile || !dependencies.isTFile(latestFile)) {
+		const latestFile = app.vault.getAbstractFileByPath(originalNotePath);
+		if (noteFile.path !== originalNotePath || latestFile !== noteFile || !dependencies.isTFile(latestFile)) {
 			reason = 'NOTE_MOVED_OR_DELETED';
 			dependencies.notice('Target note was moved or deleted.', 10000);
 			return;
