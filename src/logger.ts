@@ -11,11 +11,11 @@ function redact(text: string): string {
 	let out = text;
 
 	out = out.replace(/(Authorization\s*:\s*Bearer\s+)([^\s]+)/gi, '$1***REDACTED***');
-	out = out.replace(/\bBearer\s+([A-Za-z0-9\-\._~\+\/]+=*)\b/g, 'Bearer ***REDACTED***');
+	out = out.replace(/\bBearer\s+([A-Za-z0-9._~+/-]+=*)\b/g, 'Bearer ***REDACTED***');
 
 	out = out.replace(/\bsk-[A-Za-z0-9]{10,}\b/g, '***REDACTED***');
-	out = out.replace(/\bAIza[0-9A-Za-z\-_]{20,}\b/g, '***REDACTED***');
-	out = out.replace(/\b(?:xoxb|xoxp|xoxa|xoxr)-[0-9A-Za-z\-]{10,}\b/g, '***REDACTED***');
+	out = out.replace(/\bAIza[0-9A-Za-z_-]{20,}\b/g, '***REDACTED***');
+	out = out.replace(/\b(?:xoxb|xoxp|xoxa|xoxr)-[0-9A-Za-z-]{10,}\b/g, '***REDACTED***');
 	out = out.replace(/\bghp_[0-9A-Za-z]{20,}\b/g, '***REDACTED***');
 	out = out.replace(/\bgithub_pat_[0-9A-Za-z_]{20,}\b/g, '***REDACTED***');
 
@@ -34,9 +34,28 @@ function safeRedact(message: string, fallback: string): string {
 }
 
 function oneLineAndTruncate(text: string, maxLen: number): string {
-	const oneLine = text.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
+	const oneLine = text.split('	').join(' ').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
 	if (oneLine.length <= maxLen) return oneLine;
 	return oneLine.slice(0, maxLen);
+}
+
+export function safeLogMetadataValue(
+	value: unknown,
+	maxLen: number = 128,
+	fallback: string = 'unknown'
+): string {
+	const text = typeof value === 'string'
+		|| typeof value === 'number'
+		|| typeof value === 'boolean'
+		|| typeof value === 'bigint'
+		? String(value)
+		: '';
+	const redacted = safeRedact(text, fallback);
+	const safe = oneLineAndTruncate(redacted, maxLen)
+		.replace(/[^A-Za-z0-9._~+/:<>-]/g, '_')
+		.replace(/_+/g, '_')
+		.replace(/^_+|_+$/g, '');
+	return safe.length > 0 ? safe : fallback;
 }
 
 export type ErrorLogInfo = {
