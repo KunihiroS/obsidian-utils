@@ -1,22 +1,46 @@
 import {App, Notice, TFile, normalizePath} from 'obsidian';
 import {extractArxivIdFromUrl} from './arxiv';
-import {endLogBlock, formatErrorForLog, startLogBlock} from './logger';
+import {
+	appendLogLine,
+	endLogBlock,
+	formatErrorForLog,
+	safeLogMetadataValue,
+	startLogBlock,
+} from './logger';
+import type {LogBlock} from './logger';
 import type {MyPluginSettings} from './settings';
-import {createProvider} from './llm/createProvider';
+import {createProviderChain} from './llm/createProvider';
+import {summarizeWithFallback} from './llm/fallback';
 
-function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
-	return Promise.race([
-		promise,
-		new Promise<T>((_, reject) =>
-			setTimeout(() => reject(new Error(`${label}_TIMEOUT`)), ms)
-		),
-	]);
-}
+export type SummaryGeneratorDependencies = {
+	notice?: (message: string, duration?: number) => void;
+	createProviderChain?: typeof createProviderChain;
+	startLogBlock?: typeof startLogBlock;
+	appendLogLine?: typeof appendLogLine;
+	endLogBlock?: typeof endLogBlock;
+	setInterval?: (callback: () => void, ms: number) => number;
+	clearInterval?: (id: number) => void;
+	isTFile?: (file: unknown) => file is TFile;
+};
+
+const defaultDependencies = {
+	notice: (message: string, duration?: number): void => {
+		new Notice(message, duration);
+	},
+	createProviderChain,
+	startLogBlock,
+	appendLogLine,
+	endLogBlock,
+	setInterval: (callback: () => void, ms: number): number => window.setInterval(callback, ms),
+	clearInterval: (id: number): void => window.clearInterval(id),
+	isTFile: (file: unknown): file is TFile => file instanceof TFile,
+};
 
 // Summary is written as a replaceable block.
 // This keeps reruns idempotent (re-run replaces the previous summary instead of appending).
 const SUMMARY_START_MARKER = '<!-- paper_extractor:summary:start -->';
 const SUMMARY_END_MARKER = '<!-- paper_extractor:summary:end -->';
+const MAX_TIMEOUT_MS = 2_147_483_647;
 
 function buildSummaryBlock(summaryMarkdown: string): string {
 	return `${SUMMARY_START_MARKER}\n\n${summaryMarkdown}\n\n${SUMMARY_END_MARKER}`;
@@ -39,53 +63,57 @@ export async function generateSummary(
 	app: App,
 	settings: MyPluginSettings,
 	noteFile: TFile,
-	inputUrl: string
+	inputUrl: string,
+	injectedDependencies: SummaryGeneratorDependencies = {}
 ): Promise<void> {
+	const originalNotePath = noteFile.path;
+	const originalNoteBaseName = noteFile.basename;
+	const originalParentPath = noteFile.parent?.path ?? '';
+	const dependencies = {...defaultDependencies, ...injectedDependencies};
 	const id = extractArxivIdFromUrl(inputUrl);
 
 	const logDir = settings.logDir.trim();
 	if (logDir.length === 0) {
-		new Notice('logDir is required (Settings → Log directory)');
+		dependencies.notice('Log directory is required (Settings → Log directory).');
 		return;
 	}
 
-	const logBlock = await startLogBlock(
+	const logBlock: LogBlock = await dependencies.startLogBlock(
 		app,
 		logDir,
-		`component=summary_generator notePath=${noteFile.path} noteBaseName=${noteFile.basename} id=${id}`
+		`component=summary_generator notePath=${safeLogMetadataValue(originalNotePath)} noteBaseName=${safeLogMetadataValue(originalNoteBaseName)} id=${id}`
 	);
 
-	let reason: string = '';
+	let reason = '';
 	let result: 'OK' | 'NG' = 'NG';
-	let htmlPath: string = '';
-	let promptPath: string = '';
-	let model: string = '';
-	let providerName: string = '';
-	let summaryChars: number = 0;
-	let errorName: string = '';
-	let errorCode: string = '';
-	let errorSummary: string = '';
+	let htmlPath = '';
+	let promptPath = '';
+	let model = '';
+	let providerName = '';
+	let summaryChars = 0;
+	let errorName = '';
+	let errorCode = '';
+	let errorSummary = '';
 
 	try {
-		// Skip policy: user can disable summarization explicitly via settings.
-		// In this case, it is treated as a successful run (result=OK) with a skip reason.
 		if (settings.summaryEnabled === false) {
 			reason = 'SUMMARY_DISABLED_SKIP';
 			result = 'OK';
-			new Notice('Summary is disabled (Settings).');
+			dependencies.notice('Summary is disabled (Settings).');
 			return;
 		}
 
-		new Notice('(1/4) reading html');
-		const parentPath = noteFile.parent?.path ?? '';
-		const folderPath = normalizePath(parentPath ? `${parentPath}/${noteFile.basename}` : noteFile.basename);
+		dependencies.notice('(1/4) Reading HTML.');
+		const folderPath = normalizePath(originalParentPath
+			? `${originalParentPath}/${originalNoteBaseName}`
+			: originalNoteBaseName);
 		htmlPath = normalizePath(`${folderPath}/${id}.html`);
 
 		const adapter = app.vault.adapter;
 		const htmlExists = await adapter.exists(htmlPath);
 		if (!htmlExists) {
 			reason = 'HTML_MISSING';
-			new Notice('HTML file not found. Cannot generate summary.', 10000);
+			dependencies.notice('HTML file not found. Cannot generate summary.', 10000);
 			return;
 		}
 
@@ -98,20 +126,20 @@ export async function generateSummary(
 			errorName = info.errorName;
 			errorCode = info.errorCode;
 			errorSummary = info.errorSummary;
-			new Notice('Failed to read HTML.', 10000);
+			dependencies.notice('Failed to read HTML.', 10000);
 			return;
 		}
 
-		new Notice('(2/4) loading prompt');
+		dependencies.notice('(2/4) Loading prompt.');
 		promptPath = settings.systemPromptPath?.trim() ?? '';
 		if (promptPath.length === 0) {
 			reason = 'PROMPT_READ_FAILED';
-			new Notice('systemPromptPath is required (Settings).', 10000);
+			dependencies.notice('System prompt path is required (Settings).', 10000);
 			return;
 		}
 		if (promptPath.startsWith('/') || promptPath.startsWith('~')) {
 			reason = 'PROMPT_PATH_INVALID';
-			new Notice('systemPromptPath must be a Vault-relative path (not absolute).', 10000);
+			dependencies.notice('System prompt path must be a Vault-relative path (not absolute).', 10000);
 			return;
 		}
 
@@ -124,88 +152,96 @@ export async function generateSummary(
 			errorName = info.errorName;
 			errorCode = info.errorCode;
 			errorSummary = info.errorSummary;
-			new Notice('Failed to read system prompt.', 10000);
+			dependencies.notice('Failed to read system prompt.', 10000);
 			return;
 		}
 
-		let providerResult;
+		const timeoutSec = settings.llmTimeoutSec ?? 180;
+		const timeoutMs = timeoutSec * 1000;
+		if (!Number.isFinite(timeoutSec) || timeoutSec <= 0 || timeoutMs > MAX_TIMEOUT_MS) {
+			reason = 'LLM_TIMEOUT_INVALID';
+			dependencies.notice('LLM timeout must be a positive, supported value.', 10000);
+			return;
+		}
+
+		let providerChain;
 		try {
-			providerResult = await createProvider(settings);
+			providerChain = await dependencies.createProviderChain(settings);
 		} catch (e) {
-			reason = e instanceof Error ? e.message : 'PROVIDER_CREATE_FAILED';
-			const info = formatErrorForLog(e);
-			errorName = info.errorName;
-			errorCode = info.errorCode;
-			errorSummary = info.errorSummary;
-			new Notice('LLM provider configuration error.', 10000);
+			const errorToken = e instanceof Error ? e.message.trim().split(/\s+/, 1)[0] : '';
+			if (errorToken === 'ENV_PATH_MISSING') {
+				reason = 'ENV_PATH_MISSING';
+				dependencies.notice('envPath is required (Settings).', 10000);
+			} else if (errorToken === 'ENV_READ_FAILED') {
+				reason = 'ENV_READ_FAILED';
+				dependencies.notice('Failed to read env file.', 10000);
+			} else {
+				reason = 'PROVIDER_CHAIN_CREATE_FAILED';
+				dependencies.notice('LLM provider chain could not be created.', 10000);
+			}
 			return;
 		}
 
-		if (providerResult.status === 'disabled') {
-			// `reason` is a short identifier intended for log searching/aggregation.
-			// User-facing detail is communicated via Notice.
-			reason = providerResult.reason;
-			if (reason === 'OPENAI_MODEL_EMPTY_SKIP') {
-				result = 'OK';
-				new Notice('OPENAI_MODEL is empty in .env. Skipping AI request.');
-				return;
-			}
-			if (reason === 'ENV_PATH_MISSING') {
-				new Notice('envPath is required (Settings).', 10000);
-				return;
-			}
-			if (reason === 'LLM_PROVIDER_MISSING') {
-				new Notice('LLM_PROVIDER is required in .env.', 10000);
-				return;
-			}
-			new Notice('LLM provider is disabled.');
-			return;
-		}
+		dependencies.notice('(3/4) Requesting AI.');
+		dependencies.notice('Waiting for AI response. Do not delete or move the note until completion.');
+		const waitNoticeInterval = dependencies.setInterval(() => {
+			dependencies.notice('Waiting for AI response.');
+		}, 3000);
 
-		providerName = providerResult.providerName;
-		model = providerResult.model;
-
-		new Notice('(3/4) requesting AI');
-		new Notice('AI response waiting... (Do not delete/move the note until completion)');
-		let summary: string;
-		let waitNoticeInterval: number | null = null;
+		let fallbackResult;
 		try {
-			waitNoticeInterval = window.setInterval(() => {
-				new Notice('AI response waiting...');
-			}, 3000);
-
 			const userContent = `You will be given HTML extracted from an arXiv paper. Summarize it in Japanese as Markdown.\n\n[HTML]\n${htmlText}`;
-			const timeoutMs = (settings.llmTimeoutSec ?? 180) * 1000;
-			summary = await withTimeout(
-				providerResult.provider.summarize({ systemPrompt, userContent }),
-				timeoutMs,
-				providerName.toUpperCase()
+			fallbackResult = await summarizeWithFallback(
+				providerChain,
+				{systemPrompt, userContent},
+				{
+					timeoutMs,
+					onAttempt: async (event) => {
+						const eventReason = event.type === 'failure'
+							? ` reason=${safeLogMetadataValue(event.reason)}`
+							: '';
+						await dependencies.appendLogLine(
+							app,
+							logDir,
+							`component=summary_generator event=${event.type} attempt=${event.attempt} provider=${safeLogMetadataValue(event.providerName)} model=${safeLogMetadataValue(event.model)}${eventReason}`
+						);
+					},
+				}
 			);
-		} catch (e) {
-			reason = `${providerName.toUpperCase()}_REQUEST_FAILED`;
-			const info = formatErrorForLog(e);
-			errorName = info.errorName;
-			errorCode = info.errorCode;
-			errorSummary = info.errorSummary;
-			new Notice('AI request failed.', 10000);
+		} catch {
+			reason = 'ALL_LLM_ATTEMPTS_FAILED';
+			dependencies.notice('All AI requests failed.', 10000);
 			return;
 		} finally {
-			if (waitNoticeInterval !== null) {
-				window.clearInterval(waitNoticeInterval);
-			}
+			dependencies.clearInterval(waitNoticeInterval);
 		}
-		summaryChars = summary.length;
 
-		new Notice('(4/4) writing note');
-		const latestFile = app.vault.getAbstractFileByPath(noteFile.path);
-		if (!(latestFile instanceof TFile)) {
+		providerName = fallbackResult.providerName;
+		model = fallbackResult.model;
+		summaryChars = fallbackResult.summary.length;
+
+		dependencies.notice('(4/4) Writing note.');
+		const latestFile = app.vault.getAbstractFileByPath(originalNotePath);
+		if (noteFile.path !== originalNotePath || latestFile !== noteFile || !dependencies.isTFile(latestFile)) {
 			reason = 'NOTE_MOVED_OR_DELETED';
-			new Notice('Target note was moved or deleted.', 10000);
+			dependencies.notice('Target note was moved or deleted.', 10000);
 			return;
 		}
 
-		const currentNoteText = await app.vault.read(latestFile);
-		const updated = upsertSummaryBlock(currentNoteText, summary);
+		let currentNoteText: string;
+		try {
+			currentNoteText = await app.vault.read(latestFile);
+		} catch (e) {
+			reason = 'NOTE_READ_FAILED';
+			const info = formatErrorForLog(e);
+			errorName = info.errorName;
+			errorCode = info.errorCode;
+			errorSummary = info.errorSummary;
+			dependencies.notice('Failed to read note.', 10000);
+			return;
+		}
+
+		const updated = upsertSummaryBlock(currentNoteText, fallbackResult.summary);
 		try {
 			await app.vault.modify(latestFile, updated);
 		} catch (e) {
@@ -214,31 +250,40 @@ export async function generateSummary(
 			errorName = info.errorName;
 			errorCode = info.errorCode;
 			errorSummary = info.errorSummary;
-			new Notice('Failed to write note.', 10000);
+			dependencies.notice('Failed to write note.', 10000);
 			return;
 		}
 
 		result = 'OK';
-		new Notice('Summary generated.');
+		dependencies.notice('Summary generated.');
 	} catch (e) {
 		reason = reason || 'UNKNOWN';
 		const info = formatErrorForLog(e);
 		errorName = info.errorName;
 		errorCode = info.errorCode;
 		errorSummary = info.errorSummary;
-		new Notice('Summary generation failed.', 10000);
+		dependencies.notice('Summary generation failed.', 10000);
 	} finally {
+		const safeReason = safeLogMetadataValue(reason || (result === 'OK' ? 'OK' : 'UNKNOWN'));
+		const safeProvider = safeLogMetadataValue(providerName);
+		const safeModel = safeLogMetadataValue(model);
+		const safeHtmlPath = safeLogMetadataValue(htmlPath);
+		const safePromptPath = safeLogMetadataValue(promptPath);
 		if (result === 'OK') {
-			await endLogBlock(
+			await dependencies.endLogBlock(
 				app,
 				logBlock,
-				`result=OK reason=${reason || 'OK'} htmlPath=${htmlPath} provider=${providerName} model=${model} summaryChars=${summaryChars}`
+				`result=OK reason=${safeReason} htmlPath=${safeHtmlPath} provider=${safeProvider} model=${safeModel} summaryChars=${summaryChars}`
 			);
 		} else {
 			const errorPart = errorName.length > 0 || errorCode.length > 0 || errorSummary.length > 0
-				? ` errorName=${errorName} errorCode=${errorCode} errorSummary=${errorSummary}`
+				? ` errorName=${safeLogMetadataValue(errorName)} errorCode=${safeLogMetadataValue(errorCode)} errorSummary=${safeLogMetadataValue(errorSummary)}`
 				: '';
-			await endLogBlock(app, logBlock, `result=NG reason=${reason || 'UNKNOWN'} htmlPath=${htmlPath} promptPath=${promptPath} provider=${providerName} model=${model}${errorPart}`);
+			await dependencies.endLogBlock(
+				app,
+				logBlock,
+				`result=NG reason=${safeReason} htmlPath=${safeHtmlPath} promptPath=${safePromptPath} provider=${safeProvider} model=${safeModel}${errorPart}`
+			);
 		}
 	}
 }

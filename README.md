@@ -41,36 +41,41 @@ Open **Settings → Community plugins → paper_extractor**.
 `.env` file example:
 
 ```dotenv
-# Select the LLM provider (required to run summary generation)
-# - "openai" or "gemini"
-LLM_PROVIDER="gemini"
-
 ########################################
-# Gemini (Google AI Studio API Key)
+# OpenAI API key
 ########################################
-
-# Required when LLM_PROVIDER="gemini"
-GEMINI_API_KEY="YOUR_GEMINI_API_KEY"
-
-# Required when LLM_PROVIDER="gemini"
-GEMINI_MODEL="gemini-3-flash-preview"
-
-########################################
-# OpenAI
-########################################
-
-# Required when LLM_PROVIDER="openai"
-OPENAI_API_KEY="sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-
-# If empty or missing: summary generation is skipped by design
+OPENAI_API_KEY="YOUR_OPENAI_API_KEY"
 OPENAI_MODEL="gpt-5.2"
+
+########################################
+# Codex OAuth (optional model override)
+########################################
+# Defaults to gpt-5.4-mini when omitted or empty
+CODEX_MODEL="gpt-5.4-mini"
+
+########################################
+# Gemini API key
+########################################
+GEMINI_API_KEY="YOUR_GEMINI_API_KEY"
+GEMINI_MODEL="gemini-3-flash-preview"
 ```
 
-Summary generation behavior (semi-normal cases):
+Summary generation behavior:
 
-- If `summaryEnabled` is disabled in Settings: summary generation is skipped by design.
-- If `LLM_PROVIDER` is missing in `.env`: summary generation does not run (and the run is recorded as `result=NG` in logs).
-- If `LLM_PROVIDER="openai"` and `OPENAI_MODEL` is empty: the plugin skips the OpenAI request by design.
+- Providers are attempted in a fixed order: OpenAI API key → Codex OAuth → Gemini API key. There is no provider selector.
+- Missing configuration or a provider failure falls through to the next provider. The configured timeout applies separately to each provider attempt; its default is 180 seconds and it must be a positive, supported value.
+- If every provider fails, the run fails and the existing summary block is not written or replaced.
+- If `summaryEnabled` is disabled in Settings, summary generation is skipped without reading provider configuration or writing a summary.
+
+### Codex OAuth
+
+Codex OAuth support is desktop-only and uses the Linux/POSIX Codex authentication path `~/.codex/auth.json`. The plugin reads this file in read-only mode on every Codex request. Authentication requires `auth_mode` to be `chatgpt`, plus an access token and account ID.
+
+The plugin never refreshes credentials, writes the auth file, or runs the Codex CLI. After an HTTP 401 response, it reloads the file and retries once only when the account ID is unchanged. An account switch or another authentication failure ends the Codex attempt and falls through to Gemini.
+
+Before reading credentials, the plugin verifies POSIX ownership and permissions, rejects symbolic links, and enforces an auth-file size limit. Codex OAuth is therefore unavailable on mobile and unsupported non-POSIX environments.
+
+Codex responses are bounded before SSE parsing to 4 Mi characters. The parser also limits one event's data to 256 Ki characters, one response to 10,000 events, and cumulative summary output to 512 Ki characters. These limits bound parser work and accepted output; they are not a streaming transport bound because Obsidian's request API buffers the response first.
 
 ## Template format
 
@@ -124,7 +129,8 @@ Behavior when the folder already exists:
 
 - Logs are appended daily into `logDir`.
 - File name: `paper_extractor_YYYYMMDD.log`
-- Sensitive values are redacted before writing logs.
+- Logs include provider-attempt transitions and the final selected provider/model.
+- Sensitive values, API keys, access tokens, account IDs, and auth-file contents are not logged; additional redaction is applied before writing logs.
 
 ## Troubleshooting
 
@@ -137,8 +143,10 @@ Behavior when the folder already exists:
 - **Summary generation fails**
   - Verify `systemPromptPath` (Vault path) exists.
   - Verify `envPath` (absolute path) exists.
-  - Verify `summaryEnabled` and `.env` settings.
-  - See "Summary generation behavior (semi-normal cases)" above.
+  - Verify `summaryEnabled` and the OpenAI/Gemini key and model pairs in `.env`.
+  - For Codex OAuth, verify Codex is logged in with ChatGPT authentication and that `~/.codex/auth.json` has the current user as owner, restrictive POSIX permissions, a supported size, and is not a symbolic link.
+  - Inspect the safe provider-attempt transitions in the log to see which fixed-order attempts failed.
+  - See "Summary generation behavior" above.
 - **"Already running"**
   - The plugin prevents concurrent runs. Wait for the current run to finish.
 
@@ -146,7 +154,9 @@ Behavior when the folder already exists:
 
 - API keys must not be stored inside the Vault.
 - The plugin reads LLM credentials from an external `.env` file.
-- Logs enforce redaction to avoid accidentally writing secrets into files.
+- Codex credentials remain in the external read-only `~/.codex/auth.json`; the plugin neither refreshes nor writes them and never invokes the Codex CLI.
+- Keep `.env` and `~/.codex/auth.json` owned by the current user with restrictive filesystem permissions. Do not use a symbolic link for the Codex auth file.
+- Logs enforce redaction and contain provider/model metadata and fixed failure reasons, not credentials or raw provider errors.
 
 ## Development
 
@@ -167,6 +177,14 @@ pnpm run dev
 ```bash
 pnpm run build
 ```
+
+### Lint
+
+```bash
+pnpm run lint
+```
+
+`eslint-suppressions.json` is a temporary, count-based baseline for pre-existing lint errors discovered during KUN-1036. It fails when a file/rule count rises above the baseline, but it cannot detect a same-count replacement within that file/rule. KUN-1040 owns removing the baseline; feature work must not regenerate or expand it and should lint changed files directly.
 
 ### Manual install (local)
 

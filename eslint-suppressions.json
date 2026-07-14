@@ -1,0 +1,50 @@
+{
+  "src/llm/providers/openai_chat_provider.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unnecessary-type-assertion": {
+      "count": 1
+    },
+    "@typescript-eslint/no-unsafe-assignment": {
+      "count": 2
+    },
+    "@typescript-eslint/no-unsafe-member-access": {
+      "count": 1
+    }
+  },
+  "src/main.ts": {
+    "obsidianmd/sample-names": {
+      "count": 1
+    },
+    "obsidianmd/ui/sentence-case": {
+      "count": 5
+    }
+  },
+  "src/paper_fetcher.ts": {
+    "obsidianmd/ui/sentence-case": {
+      "count": 1
+    }
+  },
+  "src/settings.ts": {
+    "obsidianmd/hardcoded-config-path": {
+      "count": 2
+    },
+    "obsidianmd/sample-names": {
+      "count": 2
+    },
+    "obsidianmd/ui/sentence-case": {
+      "count": 4
+    }
+  },
+  "src/title_parser.ts": {
+    "no-useless-escape": {
+      "count": 1
+    }
+  },
+  "test/title_parser.test.mjs": {
+    "no-undef": {
+      "count": 1
+    }
+  }
+}
